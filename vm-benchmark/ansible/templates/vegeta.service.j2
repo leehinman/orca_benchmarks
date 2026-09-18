@@ -1,0 +1,15 @@
+[Unit]
+Description=Vegeta load generator
+After=network.target
+
+[Service]
+Type=simple
+Environment=RATE=500
+EnvironmentFile=-/etc/default/vegeta
+ExecStartPre=/bin/bash -c 'printf "GET http://{{ agent_internal_ip }}:8080\nGET http://{{ agent_internal_ip }}:8080/invalid\n" > /tmp/vegeta-targets.txt'
+ExecStart=/usr/local/bin/vegeta attack -targets /tmp/vegeta-targets.txt -rate=${RATE}/s -duration=0 -max-workers=64 -timeout=10s -output /dev/null
+StandardOutput=null
+OOMScoreAdjust=1000
+
+[Install]
+WantedBy=multi-user.target

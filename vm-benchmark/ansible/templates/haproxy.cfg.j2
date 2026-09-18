@@ -1,0 +1,19 @@
+global
+    log 127.0.0.1:9001 local0 info
+    maxconn 50000
+
+defaults
+    log     global
+    mode    http
+    option  httplog
+    option  dontlognull
+    timeout connect 5s
+    timeout client  30s
+    timeout server  30s
+
+frontend http_front
+    bind *:8080
+    default_backend apache_back
+
+backend apache_back
+    server local 127.0.0.1:80

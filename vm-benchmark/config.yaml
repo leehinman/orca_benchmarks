@@ -1,0 +1,282 @@
+benchmark:
+  name: vm-benchmark
+
+# Defaults for every ${NAME} knob below. Override in orca.env next to this
+# file (or --env-file, or the process environment); see README "Variables".
+# ORCA_PROVIDER and TF_VAR_* must stay the same for up, bench, and down.
+# TF_VAR_agent_count is the number of elastic-agent VMs (1, 2, 4, or 8); each
+# gets a dedicated generator VM. The tofu modules support 0-8.
+# VEGETA_EPS and LOGGEN_EPS are per-generator-VM rates applied at each bench.
+# AGENT_METRICS_PERIOD is the elastic-agent self-monitoring sample interval,
+# set on the agent policy at up.
+variables:
+  ORCA_PROVIDER: multipass
+  TF_VAR_agent_count: "4"
+  ELASTIC_VERSION: 9.6.0-SNAPSHOT
+  AGENT_VERSION: 9.2.8
+  AGENT_METRICS_PERIOD: 15s
+  VEGETA_EPS: "500"
+  LOGGEN_EPS: "500"
+
+elasticsearch:
+  url: "https://${steps.infra.elasticsearch_ip}:9200"
+  username: "elastic"
+  password: "changeme"
+  ca_path: "${scratch}/../certs/ca.crt"
+
+kibana:
+  url: "https://${steps.infra.kibana_ip}:5601"
+  username: "elastic"
+  password: "changeme"
+  ca_path: "${scratch}/../certs/ca.crt"
+
+phases:
+
+  # ── Setup ────────────────────────────────────────────────────────────────────
+  # Provisions VMs with OpenTofu using the module selected by ORCA_PROVIDER
+  # (multipass or gcp) and captures the address the operator
+  # uses (*_ip), the address VMs use for each other (*_internal_ip), and the
+  # agent hostnames. The SSH public key is read from ~/.ssh/id_rsa_yubikey.pub
+  # by default; override with TF_VAR_ssh_public_key_file. See README for the
+  # GCP variables.
+  setup:
+    - id: infra
+      opentofu:
+        dir: ./tofu/${ORCA_PROVIDER}
+        outputs:
+          elasticsearch_ip: {}
+          elasticsearch_internal_ip: {}
+          kibana_ip: {}
+          kibana_internal_ip: {}
+          fleet_server_ip: {}
+          fleet_server_internal_ip: {}
+          elastic_agent_ip_0: {}
+          elastic_agent_ip_1: {}
+          elastic_agent_ip_2: {}
+          elastic_agent_ip_3: {}
+          elastic_agent_ip_4: {}
+          elastic_agent_ip_5: {}
+          elastic_agent_ip_6: {}
+          elastic_agent_ip_7: {}
+          elastic_agent_internal_ip_0: {}
+          elastic_agent_internal_ip_1: {}
+          elastic_agent_internal_ip_2: {}
+          elastic_agent_internal_ip_3: {}
+          elastic_agent_internal_ip_4: {}
+          elastic_agent_internal_ip_5: {}
+          elastic_agent_internal_ip_6: {}
+          elastic_agent_internal_ip_7: {}
+          elastic_agent_hostname_0: {}
+          elastic_agent_hostname_1: {}
+          elastic_agent_hostname_2: {}
+          elastic_agent_hostname_3: {}
+          elastic_agent_hostname_4: {}
+          elastic_agent_hostname_5: {}
+          elastic_agent_hostname_6: {}
+          elastic_agent_hostname_7: {}
+          generator_ip_0: {}
+          generator_ip_1: {}
+          generator_ip_2: {}
+          generator_ip_3: {}
+          generator_ip_4: {}
+          generator_ip_5: {}
+          generator_ip_6: {}
+          generator_ip_7: {}
+          generator_internal_ip_0: {}
+          generator_internal_ip_1: {}
+          generator_internal_ip_2: {}
+          generator_internal_ip_3: {}
+          generator_internal_ip_4: {}
+          generator_internal_ip_5: {}
+          generator_internal_ip_6: {}
+          generator_internal_ip_7: {}
+
+  # ── Configure ────────────────────────────────────────────────────────────────
+  # Writes a dynamic Ansible inventory from the provisioned IPs, then runs the
+  # playbook to install and configure software on all VMs. The playbook writes
+  # the Fleet agent ID of each enrolled agent to agent-ids.json, exposed as
+  # ${steps.provision.<inventory-host>} for the collect phase.
+  # Hosts are given symbolic names so plays can cross-reference each other via
+  # hostvars. ansible_host is the operator-facing address; internal_ip is what
+  # the VMs use to reach each other (identical on multipass).
+  configure:
+    - write-ini:
+        output: ${scratch}/inventory.ini
+        sections:
+          - name: elasticsearch
+            entries:
+              - elasticsearch ansible_host=${steps.infra.elasticsearch_ip} internal_ip=${steps.infra.elasticsearch_internal_ip}
+          - name: kibana
+            entries:
+              - kibana ansible_host=${steps.infra.kibana_ip} internal_ip=${steps.infra.kibana_internal_ip}
+          - name: fleet_server
+            entries:
+              - fleet_server ansible_host=${steps.infra.fleet_server_ip} internal_ip=${steps.infra.fleet_server_internal_ip}
+          - name: elastic_agents
+            entries: !repeat
+              count: ${TF_VAR_agent_count}
+              as: i
+              template: "agent${i} ansible_host=${steps.infra.elastic_agent_ip_${i}} internal_ip=${steps.infra.elastic_agent_internal_ip_${i}}"
+          - name: generators
+            entries: !repeat
+              count: ${TF_VAR_agent_count}
+              as: i
+              template: "generator${i} ansible_host=${steps.infra.generator_ip_${i}} internal_ip=${steps.infra.generator_internal_ip_${i}} agent_internal_ip=${steps.infra.elastic_agent_internal_ip_${i}}"
+
+    - id: provision
+      ansible:
+        playbook: ./ansible/playbook.yml
+        inventory: ${scratch}/inventory.ini
+        requirements: ./ansible/requirements.yml
+        vars:
+          elastic_version: "${ELASTIC_VERSION}"
+          agent_version: "${AGENT_VERSION}"
+          agent_metrics_period: "${AGENT_METRICS_PERIOD}"
+          certs_dir: "${scratch}/../certs"
+          agent_ids_file: "${scratch}/agent-ids.json"
+        outputs:
+          from: file
+          path: ${scratch}/agent-ids.json
+
+  # ── Warmup ───────────────────────────────────────────────────────────────────
+  # Writes this bench's per-VM rates (VEGETA_EPS requests/s, LOGGEN_EPS CEF
+  # messages/s) to the generators' environment files, restarts vegeta and
+  # loggen on each generator VM, then waits until each agent VM has produced
+  # at least one minute of Apache access logs. A rate of 0 is not supported.
+  warmup:
+    - shell:
+        timeout: 2m
+        run: |
+          for ip in ${steps.infra.generator_ip_0} ${steps.infra.generator_ip_1} ${steps.infra.generator_ip_2} ${steps.infra.generator_ip_3} ${steps.infra.generator_ip_4} ${steps.infra.generator_ip_5} ${steps.infra.generator_ip_6} ${steps.infra.generator_ip_7}; do
+            [ -z "$ip" ] && continue
+            ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -o ConnectTimeout=20 ubuntu@$ip '
+              echo RATE=${VEGETA_EPS} | sudo tee /etc/default/vegeta >/dev/null
+              echo RATE=${LOGGEN_EPS} | sudo tee /etc/default/loggen >/dev/null
+              sudo systemctl restart vegeta loggen
+              sleep 1
+              echo "$(hostname): $(systemctl is-active vegeta loggen | paste -sd,) $(pgrep -a -x vegeta | grep -o -- "-rate=[^ ]*") $(pgrep -a -x loggen | grep -o -- "--rate=[^ ]*")"' &
+          done
+          wait
+
+    - es-log-span:
+        index: logs-apache.access-default
+        since: "${phase.warmup.start}"
+        group_by: agent.name
+        min_duration: 30s
+        expected_groups: ${TF_VAR_agent_count}
+        timeout: 5m
+
+  # ── Execute ──────────────────────────────────────────────────────────────────
+  # Runs the load for a fixed 15 minutes of wall-clock time. Ingestion may lag
+  # behind generation when Elasticsearch is saturated; that lag is a result,
+  # measured by the collect phase, not a gate.
+  execute:
+    - wait:
+        duration: 10m
+
+  # ── Collect ──────────────────────────────────────────────────────────────────
+  # Requests a diagnostics bundle from each agent via the Kibana Fleet API and
+  # downloads the zips, stops load generation, then fetches elastic-agent
+  # process metrics (memory, CPU) and output event rates for each agent VM over
+  # the execute window, producing TSV files and charts.
+  collect:
+
+    # ── stack versions ────────────────────────────────────────────────────────
+    # Queries Elasticsearch, Kibana, and Fleet for the versions actually
+    # running, since components can be upgraded between bench runs.
+    - id: versions
+      stack-versions: {}
+
+    # ── elastic-agent diagnostics bundles ─────────────────────────────────────
+    # Agent IDs come from the provision step; set hostname instead of id to
+    # look an agent up in Fleet by its enrolled hostname.
+    - id: agent-diagnostics
+      fleet-agent-diagnostics:
+        output_dir: ${results}
+        timeout: 10m
+        cpu_profile: true
+        agents: !repeat
+          count: ${TF_VAR_agent_count}
+          as: i
+          template:
+            name: agent${i}
+            id: ${steps.provision.agent${i}}
+
+    # ── stop load generation ──────────────────────────────────────────────────
+    # Inverse of the warmup step: stops vegeta and loggen on each generator VM
+    # and reports any generator that did not survive the run.
+    - shell:
+        timeout: 2m
+        run: |
+          for ip in ${steps.infra.generator_ip_0} ${steps.infra.generator_ip_1} ${steps.infra.generator_ip_2} ${steps.infra.generator_ip_3} ${steps.infra.generator_ip_4} ${steps.infra.generator_ip_5} ${steps.infra.generator_ip_6} ${steps.infra.generator_ip_7}; do
+            [ -z "$ip" ] && continue
+            ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -o ConnectTimeout=20 ubuntu@$ip '
+              for u in vegeta loggen; do
+                st=$(systemctl is-active $u)
+                [ "$st" = active ] || echo "WARNING: $(hostname) $u is $st: $(systemctl show $u -p Result --value)" >&2
+              done
+              sudo systemctl stop vegeta loggen' &
+          done
+          wait
+
+    # ── reset Apache access log ───────────────────────────────────────────────
+    # Stops elastic-agent so it releases its file handle on the access log,
+    # removes the log, then restarts Apache (which opens a fresh file) and
+    # elastic-agent, so the next bench's warmup starts from an empty log.
+    - shell:
+        timeout: 2m
+        run: |
+          for ip in ${steps.infra.elastic_agent_ip_0} ${steps.infra.elastic_agent_ip_1} ${steps.infra.elastic_agent_ip_2} ${steps.infra.elastic_agent_ip_3} ${steps.infra.elastic_agent_ip_4} ${steps.infra.elastic_agent_ip_5} ${steps.infra.elastic_agent_ip_6} ${steps.infra.elastic_agent_ip_7}; do
+            [ -z "$ip" ] && continue
+            ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -o ConnectTimeout=20 ubuntu@$ip '
+              sudo systemctl stop elastic-agent
+              sudo rm -f /var/log/apache2/access.log
+              sudo systemctl restart apache2
+              sudo systemctl start elastic-agent' &
+          done
+          wait
+
+    # ── elastic-agent process metrics + output event rates ───────────────────
+    - id: agent-metrics
+      elastic-agent-metrics:
+        index: metrics-*
+        since: ${phase.execute.start}
+        until: ${phase.collect.start}
+        output_dir: ${results}
+        output_components:
+          - elasticsearch-default
+          - elasticsearch-monitoring
+        # PNG of the Elastic Agent metrics dashboard per agent, filtered by the
+        # agent's filter over the same window; needs the kibana: block above.
+        dashboard: {}
+        agents: !repeat
+          count: ${TF_VAR_agent_count}
+          as: i
+          template:
+            id:    agent${i}
+            label: ${steps.infra.elastic_agent_hostname_${i}}
+            component_ids:
+              - elastic-agent
+              - elastic-otel-collector
+            filter:
+              agent.name: ${steps.infra.elastic_agent_hostname_${i}}
+
+    # ── Elasticsearch node metrics + per-data-stream event rates ──────────
+    # Node stats (indexing rate, CPU, heap) as TSV + charts, plus a document
+    # count per data stream over the execute window and the resulting
+    # observed events/sec.
+    - id: es-metrics
+      elasticsearch-metrics:
+        since: ${phase.execute.start}
+        until: ${phase.collect.start}
+        output_dir: ${results}
+
+  # ── Report ───────────────────────────────────────────────────────────────────
+  # All charts are produced in collect; nothing to render here.
+  report: []
+
+  # ── Teardown ─────────────────────────────────────────────────────────────────
+  teardown:
+    - opentofu:
+        dir: ./tofu/${ORCA_PROVIDER}
+        destroy: true

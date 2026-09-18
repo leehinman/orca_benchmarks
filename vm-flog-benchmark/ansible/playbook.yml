@@ -1,0 +1,1606 @@
+---
+# Play 1: Prepare all VMs. The optional dist-upgrade is off by default: it
+# downloads a new kernel on every fresh VM, which has taken 30+ minutes on
+# slow mirrors, and the benchmark does not need it. Enable with -e dist_upgrade=true.
+- name: Prepare all VMs
+  hosts: all
+  become: true
+  gather_facts: false
+  any_errors_fatal: true
+  vars:
+    dist_upgrade: false
+
+  tasks:
+    - name: Wait for SSH to come up
+      ansible.builtin.wait_for_connection:
+        delay: 5
+        sleep: 5
+        timeout: 600
+
+    - name: Wait for cloud-init to finish
+      ansible.builtin.command: cloud-init status --wait
+      changed_when: false
+      failed_when: false
+
+    - name: Update apt cache
+      ansible.builtin.apt:
+        update_cache: true
+        cache_valid_time: 0
+
+    - name: Hold Elastic packages during dist-upgrade
+      ansible.builtin.shell: >
+        apt-mark hold
+        elasticsearch kibana elastic-agent fleet-server
+        2>/dev/null || true
+      changed_when: false
+      when: dist_upgrade | bool
+
+    - name: Dist-upgrade (skip unfetchable packages)
+      ansible.builtin.shell: apt-get -y -o Acquire::Retries=3 --fix-missing dist-upgrade
+      register: dist_upgrade_result
+      changed_when: "'0 upgraded' not in dist_upgrade_result.stdout"
+      ignore_errors: true
+      timeout: 1200
+      when: dist_upgrade | bool
+
+    - name: Wait for background apt and dpkg processes to finish
+      ansible.builtin.shell: pgrep -x 'apt-get|apt|dpkg' || pgrep -f '/usr/bin/unattended-upgrade( |$)'
+      register: apt_procs
+      until: apt_procs.rc == 1
+      retries: 120
+      delay: 10
+      failed_when: apt_procs.rc not in [0, 1]
+      changed_when: false
+      when: dist_upgrade | bool
+
+    - name: Unhold Elastic packages after dist-upgrade
+      ansible.builtin.shell: >
+        apt-mark unhold
+        elasticsearch kibana elastic-agent fleet-server
+        2>/dev/null || true
+      changed_when: false
+      when: dist_upgrade | bool
+
+# Play 2: Generate TLS certificates on the control node
+- name: Generate TLS certificates
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  any_errors_fatal: true
+
+  tasks:
+    - name: Create certs directory
+      ansible.builtin.file:
+        path: "{{ certs_dir }}"
+        state: directory
+        mode: '0700'
+
+    - name: Generate CA private key
+      community.crypto.openssl_privatekey:
+        path: "{{ certs_dir }}/ca.key"
+        size: 4096
+
+    - name: Generate CA CSR
+      community.crypto.openssl_csr_pipe:
+        privatekey_path: "{{ certs_dir }}/ca.key"
+        common_name: "Benchmark CA"
+        use_common_name_for_san: false
+        basic_constraints:
+          - "CA:TRUE"
+        basic_constraints_critical: true
+        key_usage:
+          - keyCertSign
+          - cRLSign
+        key_usage_critical: true
+      register: ca_csr
+
+    - name: Generate self-signed CA certificate
+      community.crypto.x509_certificate:
+        path: "{{ certs_dir }}/ca.crt"
+        privatekey_path: "{{ certs_dir }}/ca.key"
+        csr_content: "{{ ca_csr.csr }}"
+        provider: selfsigned
+        selfsigned_not_after: "+3650d"
+
+    - name: Generate Elasticsearch private key
+      community.crypto.openssl_privatekey:
+        path: "{{ certs_dir }}/es.key"
+        size: 2048
+
+    - name: Generate Elasticsearch CSR
+      community.crypto.openssl_csr_pipe:
+        privatekey_path: "{{ certs_dir }}/es.key"
+        common_name: "elasticsearch"
+        subject_alt_name:
+          - "IP:{{ hostvars['elasticsearch']['ansible_host'] }}"
+          - "IP:{{ hostvars['elasticsearch']['internal_ip'] | default(hostvars['elasticsearch']['ansible_host']) }}"
+          - "DNS:elasticsearch"
+      register: es_csr
+
+    - name: Generate Elasticsearch certificate
+      community.crypto.x509_certificate:
+        path: "{{ certs_dir }}/es.crt"
+        csr_content: "{{ es_csr.csr }}"
+        ownca_path: "{{ certs_dir }}/ca.crt"
+        ownca_privatekey_path: "{{ certs_dir }}/ca.key"
+        provider: ownca
+        ownca_not_after: "+3650d"
+
+    - name: Generate Kibana private key
+      community.crypto.openssl_privatekey:
+        path: "{{ certs_dir }}/kibana.key"
+        size: 2048
+
+    - name: Generate Kibana CSR
+      community.crypto.openssl_csr_pipe:
+        privatekey_path: "{{ certs_dir }}/kibana.key"
+        common_name: "kibana"
+        subject_alt_name:
+          - "IP:{{ hostvars['kibana']['ansible_host'] }}"
+          - "IP:{{ hostvars['kibana']['internal_ip'] | default(hostvars['kibana']['ansible_host']) }}"
+          - "DNS:kibana"
+      register: kibana_csr
+
+    - name: Generate Kibana certificate
+      community.crypto.x509_certificate:
+        path: "{{ certs_dir }}/kibana.crt"
+        csr_content: "{{ kibana_csr.csr }}"
+        ownca_path: "{{ certs_dir }}/ca.crt"
+        ownca_privatekey_path: "{{ certs_dir }}/ca.key"
+        provider: ownca
+        ownca_not_after: "+3650d"
+
+    - name: Generate Fleet Server private key
+      community.crypto.openssl_privatekey:
+        path: "{{ certs_dir }}/fleet.key"
+        size: 2048
+
+    - name: Generate Fleet Server CSR
+      community.crypto.openssl_csr_pipe:
+        privatekey_path: "{{ certs_dir }}/fleet.key"
+        common_name: "fleet-server"
+        subject_alt_name:
+          - "IP:{{ hostvars['fleet_server']['ansible_host'] }}"
+          - "IP:{{ hostvars['fleet_server']['internal_ip'] | default(hostvars['fleet_server']['ansible_host']) }}"
+          - "DNS:fleet-server"
+      register: fleet_csr
+
+    - name: Generate Fleet Server certificate
+      community.crypto.x509_certificate:
+        path: "{{ certs_dir }}/fleet.crt"
+        csr_content: "{{ fleet_csr.csr }}"
+        ownca_path: "{{ certs_dir }}/ca.crt"
+        ownca_privatekey_path: "{{ certs_dir }}/ca.key"
+        provider: ownca
+        ownca_not_after: "+3650d"
+
+# Play 3: Install and configure Elasticsearch
+- name: Install and configure Elasticsearch
+  hosts: elasticsearch
+  become: true
+  any_errors_fatal: true
+  vars_files: [vars.yml]
+
+  tasks:
+    - name: Install prerequisites
+      ansible.builtin.apt:
+        name:
+          - apt-transport-https
+          - gnupg
+          - curl
+        state: present
+        update_cache: true
+
+    - name: Add Elastic GPG key
+      ansible.builtin.shell:
+        cmd: curl -fsSL https://artifacts.elastic.co/GPG-KEY-elasticsearch | gpg --dearmor -o /usr/share/keyrings/elasticsearch-keyring.gpg
+        creates: /usr/share/keyrings/elasticsearch-keyring.gpg
+
+    - name: Install Elasticsearch via apt repository
+      when: not (elastic_is_snapshot | bool)
+      block:
+        - name: Add Elastic apt repository
+          ansible.builtin.apt_repository:
+            repo: "deb [signed-by=/usr/share/keyrings/elasticsearch-keyring.gpg] {{ elastic_repo_url }} stable main"
+            state: present
+            filename: "elastic-{{ elastic_major_version }}.x"
+        - name: Install Elasticsearch
+          ansible.builtin.apt:
+            name: "elasticsearch={{ elastic_version_apt }}"
+            state: present
+            update_cache: true
+            allow_downgrade: true
+
+    - name: Install Elasticsearch from snapshot deb
+      when: elastic_is_snapshot | bool
+      block:
+        - name: Look up Elasticsearch snapshot package URL
+          ansible.builtin.uri:
+            url: "{{ elastic_artifacts_api }}/elasticsearch-{{ elastic_version }}-{{ elastic_deb_arch }}.deb"
+            timeout: 300
+            return_content: true
+          register: es_artifact
+          delegate_to: localhost
+          run_once: true
+          become: false
+        - name: Download Elasticsearch snapshot deb
+          ansible.builtin.get_url:
+            url: "{{ es_artifact.json.packages['elasticsearch-' + elastic_version + '-' + elastic_deb_arch + '.deb'].url }}"
+            dest: "/tmp/elasticsearch-{{ elastic_version }}.deb"
+            timeout: 300
+          register: es_snapshot_deb_dl
+          until: es_snapshot_deb_dl is succeeded
+          retries: 3
+          delay: 15
+        - name: Install Elasticsearch deb
+          ansible.builtin.apt:
+            deb: "/tmp/elasticsearch-{{ elastic_version }}.deb"
+            state: present
+
+    - name: Create certs directory
+      ansible.builtin.file:
+        path: /etc/elasticsearch/certs
+        state: directory
+        owner: root
+        group: elasticsearch
+        mode: '0750'
+
+    - name: Copy CA certificate
+      ansible.builtin.copy:
+        src: "{{ certs_dir }}/ca.crt"
+        dest: /etc/elasticsearch/certs/ca.crt
+        owner: root
+        group: elasticsearch
+        mode: '0640'
+
+    - name: Copy Elasticsearch certificate
+      ansible.builtin.copy:
+        src: "{{ certs_dir }}/es.crt"
+        dest: /etc/elasticsearch/certs/es.crt
+        owner: root
+        group: elasticsearch
+        mode: '0640'
+
+    - name: Copy Elasticsearch private key
+      ansible.builtin.copy:
+        src: "{{ certs_dir }}/es.key"
+        dest: /etc/elasticsearch/certs/es.key
+        owner: root
+        group: elasticsearch
+        mode: '0640'
+
+    - name: Configure Elasticsearch
+      ansible.builtin.template:
+        src: templates/elasticsearch.yml.j2
+        dest: /etc/elasticsearch/elasticsearch.yml
+        owner: root
+        group: elasticsearch
+        mode: '0660'
+      notify: Restart Elasticsearch
+
+    - name: Set vm.max_map_count
+      ansible.posix.sysctl:
+        name: vm.max_map_count
+        value: '262144'
+        state: present
+        sysctl_file: /etc/sysctl.d/99-elasticsearch.conf
+        reload: true
+
+    - name: Enable and start Elasticsearch
+      ansible.builtin.systemd:
+        name: elasticsearch
+        enabled: true
+        state: started
+      register: es_start
+      ignore_errors: true
+
+    - name: Collect Elasticsearch journal logs on failure
+      ansible.builtin.command: journalctl -u elasticsearch.service --no-pager -n 50
+      register: es_journal
+      when: es_start is failed
+
+    - name: Show Elasticsearch journal logs
+      ansible.builtin.fail:
+        msg: "{{ es_journal.stdout }}"
+      when: es_start is failed
+
+    - name: Wait for Elasticsearch port to open
+      ansible.builtin.wait_for:
+        port: 9200
+        timeout: 60
+
+    - name: Set elastic user password
+      ansible.builtin.shell: |
+        printf '%s\n%s\n' "{{ elastic_password }}" "{{ elastic_password }}" | \
+        /usr/share/elasticsearch/bin/elasticsearch-reset-password -u elastic -i -s -b
+      no_log: true
+      changed_when: true
+
+    - name: Delete existing Kibana service account token
+      ansible.builtin.uri:
+        url: "https://{{ ansible_host }}:9200/_security/service/elastic/kibana/credential/token/ansible-managed"
+        timeout: 300
+        method: DELETE
+        user: elastic
+        password: "{{ elastic_password }}"
+        ca_path: "{{ certs_dir }}/ca.crt"
+        status_code: [200, 404]
+      delegate_to: localhost
+      become: false
+      no_log: true
+
+    - name: Create Kibana service account token
+      ansible.builtin.uri:
+        url: "https://{{ ansible_host }}:9200/_security/service/elastic/kibana/credential/token/ansible-managed"
+        timeout: 300
+        method: POST
+        user: elastic
+        password: "{{ elastic_password }}"
+        ca_path: "{{ certs_dir }}/ca.crt"
+      delegate_to: localhost
+      become: false
+      register: kibana_token_response
+      no_log: true
+
+    - name: Store Kibana service token as host fact
+      ansible.builtin.set_fact:
+        kibana_service_token: "{{ kibana_token_response.json.token.value }}"
+      no_log: true
+
+    - name: Delete existing Fleet Server service account token
+      ansible.builtin.uri:
+        url: "https://{{ ansible_host }}:9200/_security/service/elastic/fleet-server/credential/token/ansible-managed"
+        timeout: 300
+        method: DELETE
+        user: elastic
+        password: "{{ elastic_password }}"
+        ca_path: "{{ certs_dir }}/ca.crt"
+        status_code: [200, 404]
+      delegate_to: localhost
+      become: false
+      no_log: true
+
+    - name: Create Fleet Server service account token
+      ansible.builtin.uri:
+        url: "https://{{ ansible_host }}:9200/_security/service/elastic/fleet-server/credential/token/ansible-managed"
+        timeout: 300
+        method: POST
+        user: elastic
+        password: "{{ elastic_password }}"
+        ca_path: "{{ certs_dir }}/ca.crt"
+      delegate_to: localhost
+      become: false
+      register: fleet_token_response
+      no_log: true
+
+    - name: Store Fleet Server service token as host fact
+      ansible.builtin.set_fact:
+        fleet_service_token: "{{ fleet_token_response.json.token.value }}"
+      no_log: true
+
+  handlers:
+    - name: Restart Elasticsearch
+      ansible.builtin.systemd:
+        name: elasticsearch
+        state: restarted
+
+# Play 4: Install and configure Kibana
+- name: Install and configure Kibana
+  hosts: kibana
+  become: true
+  vars_files: [vars.yml]
+  any_errors_fatal: true
+
+  tasks:
+    - name: Install prerequisites
+      ansible.builtin.apt:
+        name:
+          - apt-transport-https
+          - gnupg
+          - curl
+        state: present
+        update_cache: true
+
+    - name: Install headless Chromium dependencies for Kibana reporting
+      ansible.builtin.apt:
+        name:
+          - fonts-liberation
+          - libfontconfig1
+          - libnss3
+        state: present
+
+    - name: Add Elastic GPG key
+      ansible.builtin.shell:
+        cmd: curl -fsSL https://artifacts.elastic.co/GPG-KEY-elasticsearch | gpg --dearmor -o /usr/share/keyrings/elasticsearch-keyring.gpg
+        creates: /usr/share/keyrings/elasticsearch-keyring.gpg
+
+    - name: Install Kibana via apt repository
+      when: not (elastic_is_snapshot | bool)
+      block:
+        - name: Add Elastic apt repository
+          ansible.builtin.apt_repository:
+            repo: "deb [signed-by=/usr/share/keyrings/elasticsearch-keyring.gpg] {{ elastic_repo_url }} stable main"
+            state: present
+            filename: "elastic-{{ elastic_major_version }}.x"
+        - name: Install Kibana
+          ansible.builtin.apt:
+            name: "kibana={{ elastic_version_apt }}"
+            state: present
+            update_cache: true
+            allow_downgrade: true
+
+    - name: Install Kibana from snapshot deb
+      when: elastic_is_snapshot | bool
+      block:
+        - name: Look up Kibana snapshot package URL
+          ansible.builtin.uri:
+            url: "{{ elastic_artifacts_api }}/kibana-{{ elastic_version }}-{{ elastic_deb_arch }}.deb"
+            timeout: 300
+            return_content: true
+          register: kibana_artifact
+          delegate_to: localhost
+          run_once: true
+          become: false
+        - name: Download Kibana snapshot deb
+          ansible.builtin.get_url:
+            url: "{{ kibana_artifact.json.packages['kibana-' + elastic_version + '-' + elastic_deb_arch + '.deb'].url }}"
+            dest: "/tmp/kibana-{{ elastic_version }}.deb"
+            timeout: 300
+          register: kibana_snapshot_deb_dl
+          until: kibana_snapshot_deb_dl is succeeded
+          retries: 3
+          delay: 15
+        - name: Install Kibana deb
+          ansible.builtin.apt:
+            deb: "/tmp/kibana-{{ elastic_version }}.deb"
+            state: present
+
+    - name: Create certs directory
+      ansible.builtin.file:
+        path: /etc/kibana/certs
+        state: directory
+        owner: root
+        group: kibana
+        mode: '0750'
+
+    - name: Copy CA certificate
+      ansible.builtin.copy:
+        src: "{{ certs_dir }}/ca.crt"
+        dest: /etc/kibana/certs/ca.crt
+        owner: root
+        group: kibana
+        mode: '0640'
+
+    - name: Copy Kibana certificate
+      ansible.builtin.copy:
+        src: "{{ certs_dir }}/kibana.crt"
+        dest: /etc/kibana/certs/kibana.crt
+        owner: root
+        group: kibana
+        mode: '0640'
+
+    - name: Copy Kibana private key
+      ansible.builtin.copy:
+        src: "{{ certs_dir }}/kibana.key"
+        dest: /etc/kibana/certs/kibana.key
+        owner: root
+        group: kibana
+        mode: '0640'
+
+    - name: Configure Kibana
+      ansible.builtin.template:
+        src: templates/kibana.yml.j2
+        dest: /etc/kibana/kibana.yml
+        owner: root
+        group: kibana
+        mode: '0660'
+      notify: Restart Kibana
+
+    - name: Flush handlers
+      ansible.builtin.meta: flush_handlers
+
+    - name: Enable and start Kibana
+      ansible.builtin.systemd:
+        name: kibana
+        enabled: true
+        state: started
+
+    - name: Wait for Kibana Fleet API to be ready
+      ansible.builtin.uri:
+        url: "https://{{ ansible_host }}:5601/api/fleet/settings"
+        timeout: 300
+        user: elastic
+        password: "{{ elastic_password }}"
+        force_basic_auth: true
+        ca_path: "{{ certs_dir }}/ca.crt"
+        status_code: 200
+      delegate_to: localhost
+      become: false
+      register: kibana_fleet_ready
+      until: kibana_fleet_ready.status == 200
+      retries: 30
+      delay: 10
+      no_log: true
+
+    - name: Get existing Fleet Server hosts
+      ansible.builtin.uri:
+        url: "https://{{ ansible_host }}:5601/api/fleet/fleet_server_hosts"
+        timeout: 300
+        user: elastic
+        password: "{{ elastic_password }}"
+        force_basic_auth: true
+        ca_path: "{{ certs_dir }}/ca.crt"
+      delegate_to: localhost
+      become: false
+      register: existing_fleet_hosts
+
+    - name: Create Fleet Server host entry
+      ansible.builtin.uri:
+        url: "https://{{ ansible_host }}:5601/api/fleet/fleet_server_hosts"
+        timeout: 300
+        method: POST
+        headers:
+          kbn-xsrf: "true"
+        body_format: json
+        body:
+          name: "default"
+          host_urls:
+            - "https://{{ hostvars['fleet_server']['internal_ip'] | default(hostvars['fleet_server']['ansible_host']) }}:8220"
+          is_default: true
+        user: elastic
+        password: "{{ elastic_password }}"
+        force_basic_auth: true
+        ca_path: "{{ certs_dir }}/ca.crt"
+      delegate_to: localhost
+      become: false
+      when: existing_fleet_hosts.json.total == 0
+
+    - name: Update existing Fleet Server host entry
+      ansible.builtin.uri:
+        url: "https://{{ ansible_host }}:5601/api/fleet/fleet_server_hosts/{{ existing_fleet_hosts.json['items'][0].id }}"
+        timeout: 300
+        method: PUT
+        headers:
+          kbn-xsrf: "true"
+        body_format: json
+        body:
+          name: "default"
+          host_urls:
+            - "https://{{ hostvars['fleet_server']['internal_ip'] | default(hostvars['fleet_server']['ansible_host']) }}:8220"
+          is_default: true
+        user: elastic
+        password: "{{ elastic_password }}"
+        force_basic_auth: true
+        ca_path: "{{ certs_dir }}/ca.crt"
+      delegate_to: localhost
+      become: false
+      when: existing_fleet_hosts.json.total > 0
+
+    - name: Initialize Fleet
+      ansible.builtin.uri:
+        url: "https://{{ ansible_host }}:5601/api/fleet/setup"
+        timeout: 300
+        method: POST
+        headers:
+          kbn-xsrf: "true"
+        body_format: json
+        body: {}
+        user: elastic
+        password: "{{ elastic_password }}"
+        force_basic_auth: true
+        ca_path: "{{ certs_dir }}/ca.crt"
+        status_code: [200, 201]
+      delegate_to: localhost
+      become: false
+
+    - name: Get existing Fleet outputs
+      ansible.builtin.uri:
+        url: "https://{{ ansible_host }}:5601/api/fleet/outputs"
+        timeout: 300
+        user: elastic
+        password: "{{ elastic_password }}"
+        force_basic_auth: true
+        ca_path: "{{ certs_dir }}/ca.crt"
+      delegate_to: localhost
+      become: false
+      register: fleet_outputs
+
+    - name: Set default output ID
+      ansible.builtin.set_fact:
+        default_output_id: "{{ fleet_outputs.json['items'] | selectattr('is_default', 'defined') | selectattr('is_default') | map(attribute='id') | first | default('') }}"
+
+    - name: Update default Fleet output to point to Elasticsearch
+      ansible.builtin.uri:
+        url: "https://{{ ansible_host }}:5601/api/fleet/outputs/{{ default_output_id }}"
+        timeout: 300
+        method: PUT
+        headers:
+          kbn-xsrf: "true"
+        body_format: json
+        body:
+          name: "default"
+          type: "elasticsearch"
+          hosts:
+            - "https://{{ hostvars['elasticsearch']['internal_ip'] | default(hostvars['elasticsearch']['ansible_host']) }}:9200"
+          is_default: true
+          is_default_monitoring: true
+          ssl:
+            certificate_authorities:
+              - "{{ lookup('file', certs_dir + '/ca.crt') }}"
+        user: elastic
+        password: "{{ elastic_password }}"
+        force_basic_auth: true
+        ca_path: "{{ certs_dir }}/ca.crt"
+      delegate_to: localhost
+      become: false
+      when: default_output_id != ''
+
+    - name: Create default Fleet output pointing to Elasticsearch
+      ansible.builtin.uri:
+        url: "https://{{ ansible_host }}:5601/api/fleet/outputs"
+        timeout: 300
+        method: POST
+        headers:
+          kbn-xsrf: "true"
+        body_format: json
+        body:
+          name: "default"
+          type: "elasticsearch"
+          hosts:
+            - "https://{{ hostvars['elasticsearch']['internal_ip'] | default(hostvars['elasticsearch']['ansible_host']) }}:9200"
+          is_default: true
+          is_default_monitoring: true
+          ssl:
+            certificate_authorities:
+              - "{{ lookup('file', certs_dir + '/ca.crt') }}"
+        user: elastic
+        password: "{{ elastic_password }}"
+        force_basic_auth: true
+        ca_path: "{{ certs_dir }}/ca.crt"
+      delegate_to: localhost
+      become: false
+      when: default_output_id == ''
+
+    - name: Get all agent policies
+      ansible.builtin.uri:
+        url: "https://{{ ansible_host }}:5601/api/fleet/agent_policies"
+        timeout: 300
+        user: elastic
+        password: "{{ elastic_password }}"
+        force_basic_auth: true
+        ca_path: "{{ certs_dir }}/ca.crt"
+      delegate_to: localhost
+      become: false
+      register: all_policies
+
+    - name: Set Fleet Server policy ID
+      ansible.builtin.set_fact:
+        fleet_server_policy_id: "{{ all_policies.json['items'] | selectattr('is_default_fleet_server', 'defined') | selectattr('is_default_fleet_server') | map(attribute='id') | first | default('') }}"
+
+    - name: Create Fleet Server agent policy
+      ansible.builtin.uri:
+        url: "https://{{ ansible_host }}:5601/api/fleet/agent_policies"
+        timeout: 300
+        method: POST
+        headers:
+          kbn-xsrf: "true"
+        body_format: json
+        body:
+          name: "Fleet Server Policy"
+          namespace: "default"
+          is_default_fleet_server: true
+        user: elastic
+        password: "{{ elastic_password }}"
+        force_basic_auth: true
+        ca_path: "{{ certs_dir }}/ca.crt"
+        status_code: [200, 201, 409]
+      delegate_to: localhost
+      become: false
+      when: fleet_server_policy_id == ''
+
+    - name: Re-fetch policies to get Fleet Server policy ID
+      ansible.builtin.uri:
+        url: "https://{{ ansible_host }}:5601/api/fleet/agent_policies"
+        timeout: 300
+        user: elastic
+        password: "{{ elastic_password }}"
+        force_basic_auth: true
+        ca_path: "{{ certs_dir }}/ca.crt"
+      delegate_to: localhost
+      become: false
+      register: all_policies
+      when: fleet_server_policy_id == ''
+
+    - name: Update Fleet Server policy ID after creation
+      ansible.builtin.set_fact:
+        fleet_server_policy_id: "{{ all_policies.json['items'] | selectattr('is_default_fleet_server', 'defined') | selectattr('is_default_fleet_server') | map(attribute='id') | first }}"
+      when: fleet_server_policy_id == ''
+
+    - name: Set default agent policy ID
+      ansible.builtin.set_fact:
+        default_policy_id: "{{ all_policies.json['items'] | selectattr('is_default', 'defined') | selectattr('is_default') | map(attribute='id') | first | default('') }}"
+
+    - name: Create default agent policy
+      ansible.builtin.uri:
+        url: "https://{{ ansible_host }}:5601/api/fleet/agent_policies"
+        timeout: 300
+        method: POST
+        headers:
+          kbn-xsrf: "true"
+        body_format: json
+        body:
+          name: "Default Agent Policy"
+          namespace: "default"
+          is_default: true
+        user: elastic
+        password: "{{ elastic_password }}"
+        force_basic_auth: true
+        ca_path: "{{ certs_dir }}/ca.crt"
+        status_code: [200, 201, 409]
+      delegate_to: localhost
+      become: false
+      when: default_policy_id == ''
+
+    - name: Re-fetch policies to get default policy ID
+      ansible.builtin.uri:
+        url: "https://{{ ansible_host }}:5601/api/fleet/agent_policies"
+        timeout: 300
+        user: elastic
+        password: "{{ elastic_password }}"
+        force_basic_auth: true
+        ca_path: "{{ certs_dir }}/ca.crt"
+      delegate_to: localhost
+      become: false
+      register: all_policies
+      when: default_policy_id == ''
+
+    - name: Update default policy ID after creation
+      ansible.builtin.set_fact:
+        default_policy_id: "{{ all_policies.json['items'] | selectattr('is_default', 'defined') | selectattr('is_default') | map(attribute='id') | first }}"
+      when: default_policy_id == ''
+
+    - name: Create enrollment token for default agent policy
+      ansible.builtin.uri:
+        url: "https://{{ ansible_host }}:5601/api/fleet/enrollment_api_keys"
+        timeout: 300
+        method: POST
+        headers:
+          kbn-xsrf: "true"
+        body_format: json
+        body:
+          policy_id: "{{ default_policy_id }}"
+        user: elastic
+        password: "{{ elastic_password }}"
+        force_basic_auth: true
+        ca_path: "{{ certs_dir }}/ca.crt"
+      delegate_to: localhost
+      become: false
+      register: enrollment_token_response
+      no_log: true
+
+    - name: Store enrollment token as host fact
+      ansible.builtin.set_fact:
+        agent_enrollment_token: "{{ enrollment_token_response.json['item']['api_key'] }}"
+      no_log: true
+
+    - name: Get fleet_server package version from EPM
+      ansible.builtin.uri:
+        url: "https://{{ ansible_host }}:5601/api/fleet/epm/packages/fleet_server"
+        timeout: 300
+        user: elastic
+        password: "{{ elastic_password }}"
+        force_basic_auth: true
+        ca_path: "{{ certs_dir }}/ca.crt"
+      delegate_to: localhost
+      become: false
+      register: fleet_server_pkg
+
+    - name: Get existing package policies
+      ansible.builtin.uri:
+        url: "https://{{ ansible_host }}:5601/api/fleet/package_policies"
+        timeout: 300
+        user: elastic
+        password: "{{ elastic_password }}"
+        force_basic_auth: true
+        ca_path: "{{ certs_dir }}/ca.crt"
+      delegate_to: localhost
+      become: false
+      register: existing_package_policies
+
+    - name: Add fleet-server integration to Fleet Server agent policy
+      ansible.builtin.uri:
+        url: "https://{{ ansible_host }}:5601/api/fleet/package_policies"
+        timeout: 300
+        method: POST
+        headers:
+          kbn-xsrf: "true"
+        body_format: json
+        body:
+          name: "fleet-server-1"
+          namespace: "default"
+          policy_ids:
+            - "{{ fleet_server_policy_id }}"
+          package:
+            name: "fleet_server"
+            version: "{{ fleet_server_pkg.json['item']['version'] }}"
+          inputs:
+            - type: "fleet-server"
+              enabled: true
+              streams: []
+              vars: {}
+        user: elastic
+        password: "{{ elastic_password }}"
+        force_basic_auth: true
+        ca_path: "{{ certs_dir }}/ca.crt"
+        status_code: [200, 201, 409]
+      delegate_to: localhost
+      become: false
+      when: (existing_package_policies.json['items'] | selectattr('package', 'defined') | selectattr('package.name', 'equalto', 'fleet_server') | list | length) == 0
+
+    - name: Get all agent policies for agent monitoring policy lookup
+      ansible.builtin.uri:
+        url: "https://{{ ansible_host }}:5601/api/fleet/agent_policies"
+        timeout: 300
+        user: elastic
+        password: "{{ elastic_password }}"
+        force_basic_auth: true
+        ca_path: "{{ certs_dir }}/ca.crt"
+      delegate_to: localhost
+      become: false
+      register: all_policies
+
+    - name: Set agent monitoring policy ID
+      ansible.builtin.set_fact:
+        agent_monitoring_policy_id: "{{ all_policies.json['items'] | selectattr('name', 'equalto', 'Agent Monitoring Policy') | map(attribute='id') | first | default('') }}"
+
+    - name: Create agent monitoring policy
+      ansible.builtin.uri:
+        url: "https://{{ ansible_host }}:5601/api/fleet/agent_policies"
+        timeout: 300
+        method: POST
+        headers:
+          kbn-xsrf: "true"
+        body_format: json
+        body:
+          name: "Agent Monitoring Policy"
+          namespace: "default"
+          monitoring_enabled:
+            - logs
+            - metrics
+          overrides:
+            agent:
+              monitoring:
+                metrics_period: "{{ agent_metrics_period }}"
+        user: elastic
+        password: "{{ elastic_password }}"
+        force_basic_auth: true
+        ca_path: "{{ certs_dir }}/ca.crt"
+        status_code: [200, 201, 409]
+      delegate_to: localhost
+      become: false
+      register: monitoring_policy_response
+      when: agent_monitoring_policy_id == ''
+
+    - name: Set agent monitoring policy ID after creation
+      ansible.builtin.set_fact:
+        agent_monitoring_policy_id: "{{ monitoring_policy_response.json['item']['id'] }}"
+      when: agent_monitoring_policy_id == ''
+
+    - name: Create enrollment token for agent monitoring policy
+      ansible.builtin.uri:
+        url: "https://{{ ansible_host }}:5601/api/fleet/enrollment_api_keys"
+        timeout: 300
+        method: POST
+        headers:
+          kbn-xsrf: "true"
+        body_format: json
+        body:
+          policy_id: "{{ agent_monitoring_policy_id }}"
+        user: elastic
+        password: "{{ elastic_password }}"
+        force_basic_auth: true
+        ca_path: "{{ certs_dir }}/ca.crt"
+      delegate_to: localhost
+      become: false
+      register: agent_monitoring_token_response
+      no_log: true
+
+    - name: Store agent monitoring enrollment token as host fact
+      ansible.builtin.set_fact:
+        agent_monitoring_enrollment_token: "{{ agent_monitoring_token_response.json['item']['api_key'] }}"
+      no_log: true
+
+    - name: Get existing package policies for agent monitoring policy
+      ansible.builtin.uri:
+        url: "https://{{ ansible_host }}:5601/api/fleet/package_policies?kuery=ingest-package-policies.policy_ids:{{ agent_monitoring_policy_id }}"
+        timeout: 300
+        user: elastic
+        password: "{{ elastic_password }}"
+        force_basic_auth: true
+        ca_path: "{{ certs_dir }}/ca.crt"
+      delegate_to: localhost
+      become: false
+      register: agent_monitoring_package_policies
+
+    - name: Get filestream package version from EPM
+      ansible.builtin.uri:
+        url: "https://{{ ansible_host }}:5601/api/fleet/epm/packages/filestream"
+        timeout: 300
+        user: elastic
+        password: "{{ elastic_password }}"
+        force_basic_auth: true
+        ca_path: "{{ certs_dir }}/ca.crt"
+      delegate_to: localhost
+      become: false
+      register: filestream_pkg
+
+    # Custom Logs integration under test: watches the directory the flog play
+    # writes into. filestream is an "input" package (no package-shipped
+    # data_stream/<name>/ directories like apache/system have), so the
+    # streams[].data_stream block must use the package's own computed
+    # "<package>.<input type>" dataset name with dynamic_dataset/
+    # dynamic_namespace set — any other literal dataset there 404s with
+    # "Stream template not found". The real dataset override ("flog", giving
+    # logs-flog-default) goes in streams[].vars['data_stream.dataset']
+    # instead, which is what the agent actually ships to. fingerprint_length
+    # is lowered from the 1024-byte default so small FLOG_LINES_PER_FILE
+    # values still get picked up; fingerprint must be set alongside it since
+    # supplying any vars here replaces the package defaults rather than
+    # merging with them.
+    - name: Add Custom Logs (filestream) integration to agent monitoring policy
+      ansible.builtin.uri:
+        url: "https://{{ ansible_host }}:5601/api/fleet/package_policies"
+        timeout: 300
+        method: POST
+        headers:
+          kbn-xsrf: "true"
+        body_format: json
+        body:
+          name: "flog-1"
+          namespace: "default"
+          policy_ids:
+            - "{{ agent_monitoring_policy_id }}"
+          package:
+            name: "filestream"
+            version: "{{ filestream_pkg.json['item']['version'] }}"
+          inputs:
+            - type: "filestream"
+              enabled: true
+              streams:
+                - enabled: true
+                  data_stream:
+                    type: logs
+                    dataset: filestream.filestream
+                    elasticsearch:
+                      dynamic_dataset: true
+                      dynamic_namespace: true
+                  vars:
+                    paths:
+                      value:
+                        - /var/log/flog/*.log
+                      type: text
+                    data_stream.dataset:
+                      value: "flog"
+                      type: text
+                    tags:
+                      value:
+                        - forwarded
+                      type: text
+                    fingerprint:
+                      value: true
+                      type: bool
+                    fingerprint_length:
+                      value: 64
+                      type: integer
+        user: elastic
+        password: "{{ elastic_password }}"
+        force_basic_auth: true
+        ca_path: "{{ certs_dir }}/ca.crt"
+        status_code: [200, 201, 409]
+      delegate_to: localhost
+      become: false
+      when: (agent_monitoring_package_policies.json['items'] | selectattr('package', 'defined') | selectattr('package.name', 'equalto', 'filestream') | list | length) == 0
+
+    - name: Get all agent policies for es_metrics lookup
+      ansible.builtin.uri:
+        url: "https://{{ ansible_host }}:5601/api/fleet/agent_policies"
+        timeout: 300
+        user: elastic
+        password: "{{ elastic_password }}"
+        force_basic_auth: true
+        ca_path: "{{ certs_dir }}/ca.crt"
+      delegate_to: localhost
+      become: false
+      register: all_policies
+
+    - name: Set es_metrics policy ID
+      ansible.builtin.set_fact:
+        es_metrics_policy_id: "{{ all_policies.json['items'] | selectattr('name', 'equalto', 'es_metrics') | map(attribute='id') | first | default('') }}"
+
+    - name: Create es_metrics agent policy
+      ansible.builtin.uri:
+        url: "https://{{ ansible_host }}:5601/api/fleet/agent_policies"
+        timeout: 300
+        method: POST
+        headers:
+          kbn-xsrf: "true"
+        body_format: json
+        body:
+          name: "es_metrics"
+          namespace: "default"
+        user: elastic
+        password: "{{ elastic_password }}"
+        force_basic_auth: true
+        ca_path: "{{ certs_dir }}/ca.crt"
+        status_code: [200, 201]
+      delegate_to: localhost
+      become: false
+      register: es_metrics_policy_response
+      when: es_metrics_policy_id == ''
+
+    - name: Set es_metrics policy ID after creation
+      ansible.builtin.set_fact:
+        es_metrics_policy_id: "{{ es_metrics_policy_response.json['item']['id'] }}"
+      when: es_metrics_policy_id == ''
+
+    - name: Create enrollment token for es_metrics policy
+      ansible.builtin.uri:
+        url: "https://{{ ansible_host }}:5601/api/fleet/enrollment_api_keys"
+        timeout: 300
+        method: POST
+        headers:
+          kbn-xsrf: "true"
+        body_format: json
+        body:
+          policy_id: "{{ es_metrics_policy_id }}"
+        user: elastic
+        password: "{{ elastic_password }}"
+        force_basic_auth: true
+        ca_path: "{{ certs_dir }}/ca.crt"
+      delegate_to: localhost
+      become: false
+      register: es_metrics_token_response
+      no_log: true
+
+    - name: Store es_metrics enrollment token as host fact
+      ansible.builtin.set_fact:
+        es_metrics_enrollment_token: "{{ es_metrics_token_response.json['item']['api_key'] }}"
+      no_log: true
+
+    - name: Get elasticsearch integration package version from EPM
+      ansible.builtin.uri:
+        url: "https://{{ ansible_host }}:5601/api/fleet/epm/packages/elasticsearch"
+        timeout: 300
+        user: elastic
+        password: "{{ elastic_password }}"
+        force_basic_auth: true
+        ca_path: "{{ certs_dir }}/ca.crt"
+      delegate_to: localhost
+      become: false
+      register: es_integration_pkg
+
+    - name: Get existing package policies for es_metrics
+      ansible.builtin.uri:
+        url: "https://{{ ansible_host }}:5601/api/fleet/package_policies?kuery=ingest-package-policies.policy_ids:{{ es_metrics_policy_id }}"
+        timeout: 300
+        user: elastic
+        password: "{{ elastic_password }}"
+        force_basic_auth: true
+        ca_path: "{{ certs_dir }}/ca.crt"
+      delegate_to: localhost
+      become: false
+      register: es_metrics_package_policies
+
+    - name: Add elasticsearch integration to es_metrics policy
+      ansible.builtin.uri:
+        url: "https://{{ ansible_host }}:5601/api/fleet/package_policies"
+        timeout: 300
+        method: POST
+        headers:
+          kbn-xsrf: "true"
+        body_format: json
+        body:
+          name: "elasticsearch-1"
+          namespace: "default"
+          policy_ids:
+            - "{{ es_metrics_policy_id }}"
+          package:
+            name: "elasticsearch"
+            version: "{{ es_integration_pkg.json['item']['version'] }}"
+          inputs:
+            - type: "logfile"
+              enabled: false
+              streams: []
+            - type: "elasticsearch/metrics"
+              enabled: true
+              vars:
+                hosts:
+                  value:
+                    - "https://{{ hostvars['elasticsearch']['internal_ip'] | default(hostvars['elasticsearch']['ansible_host']) }}:9200"
+                  type: text
+                username:
+                  value: "elastic"
+                  type: text
+                password:
+                  value: "{{ elastic_password }}"
+                  type: password
+                ssl:
+                  value: "certificate_authorities: ['/etc/elastic-agent/certs/ca.crt']"
+                  type: yaml
+                scope:
+                  value: "node"
+                  type: text
+                leaderelection:
+                  value: false
+                  type: bool
+              streams:
+                - enabled: true
+                  data_stream: {type: metrics, dataset: elasticsearch.stack_monitoring.ccr}
+                  vars: {period: {value: "10s", type: text}}
+                - enabled: true
+                  data_stream: {type: metrics, dataset: elasticsearch.stack_monitoring.cluster_stats}
+                  vars: {period: {value: "10s", type: text}}
+                - enabled: true
+                  data_stream: {type: metrics, dataset: elasticsearch.stack_monitoring.enrich}
+                  vars: {period: {value: "10s", type: text}}
+                - enabled: true
+                  data_stream: {type: metrics, dataset: elasticsearch.stack_monitoring.index}
+                  vars: {period: {value: "10s", type: text}}
+                - enabled: true
+                  data_stream: {type: metrics, dataset: elasticsearch.stack_monitoring.index_recovery}
+                  vars: {period: {value: "10s", type: text}}
+                - enabled: true
+                  data_stream: {type: metrics, dataset: elasticsearch.stack_monitoring.index_summary}
+                  vars: {period: {value: "10s", type: text}}
+                - enabled: true
+                  data_stream: {type: metrics, dataset: elasticsearch.ingest_pipeline}
+                  vars:
+                    ingest_pipeline_processor_sampling_rate:
+                      value: "0.25"
+                      type: text
+                - enabled: true
+                  data_stream: {type: metrics, dataset: elasticsearch.stack_monitoring.ml_job}
+                  vars: {period: {value: "10s", type: text}}
+                - enabled: true
+                  data_stream: {type: metrics, dataset: elasticsearch.stack_monitoring.node}
+                  vars: {period: {value: "10s", type: text}}
+                - enabled: true
+                  data_stream: {type: metrics, dataset: elasticsearch.stack_monitoring.node_stats}
+                  vars: {period: {value: "10s", type: text}}
+                - enabled: true
+                  data_stream: {type: metrics, dataset: elasticsearch.stack_monitoring.pending_tasks}
+                  vars: {period: {value: "10s", type: text}}
+                - enabled: true
+                  data_stream: {type: metrics, dataset: elasticsearch.stack_monitoring.shard}
+                  vars: {period: {value: "10s", type: text}}
+                - enabled: true
+                  data_stream: {type: metrics, dataset: elasticsearch.stack_monitoring.security_stats}
+                  vars: {period: {value: "10s", type: text}}
+        user: elastic
+        password: "{{ elastic_password }}"
+        force_basic_auth: true
+        ca_path: "{{ certs_dir }}/ca.crt"
+        status_code: [200, 201, 409]
+      delegate_to: localhost
+      become: false
+      when: (es_metrics_package_policies.json['items'] | selectattr('package', 'defined') | selectattr('package.name', 'equalto', 'elasticsearch') | list | length) == 0
+
+  handlers:
+    - name: Restart Kibana
+      ansible.builtin.systemd:
+        name: kibana
+        state: restarted
+
+# Play 5: Install and configure Fleet Server
+- name: Install and configure Fleet Server
+  hosts: fleet_server
+  become: true
+  vars_files: [vars.yml]
+  any_errors_fatal: true
+
+  tasks:
+    - name: Check if elastic-agent fleet-server component is installed
+      ansible.builtin.shell: |
+        ls /opt/Elastic/Agent/data/elastic-agent-*/components/fleet-server 2>/dev/null && echo found || echo missing
+      register: fleet_server_check
+      changed_when: false
+
+    - name: Download elastic-agent tar.gz
+      ansible.builtin.get_url:
+        url: "https://artifacts.elastic.co/downloads/beats/elastic-agent/elastic-agent-{{ elastic_version }}-linux-{{ tgz_arch }}.tar.gz"
+        dest: "/var/tmp/elastic-agent-{{ elastic_version }}.tar.gz"
+        mode: '0644'
+        timeout: 300
+      when: not (elastic_is_snapshot | bool) and fleet_server_check.stdout == "missing"
+
+    - name: Look up elastic-agent snapshot tar.gz URL
+      ansible.builtin.uri:
+        url: "{{ elastic_artifacts_api }}/elastic-agent-{{ elastic_version }}-linux-{{ tgz_arch }}.tar.gz"
+        timeout: 300
+        return_content: true
+      register: fleet_agent_artifact
+      delegate_to: localhost
+      run_once: true
+      become: false
+      when: (elastic_is_snapshot | bool) and fleet_server_check.stdout == "missing"
+
+    - name: Download elastic-agent snapshot tar.gz
+      ansible.builtin.get_url:
+        url: "{{ fleet_agent_artifact.json.packages['elastic-agent-' + elastic_version + '-linux-' + tgz_arch + '.tar.gz'].url }}"
+        dest: "/var/tmp/elastic-agent-{{ elastic_version }}.tar.gz"
+        timeout: 300
+      register: agent_snapshot_tgz_dl
+      until: agent_snapshot_tgz_dl is succeeded
+      retries: 3
+      delay: 15
+      when: (elastic_is_snapshot | bool) and fleet_server_check.stdout == "missing"
+
+    - name: Extract elastic-agent
+      ansible.builtin.unarchive:
+        src: "/var/tmp/elastic-agent-{{ elastic_version }}.tar.gz"
+        dest: /var/tmp/
+        remote_src: true
+      when: fleet_server_check.stdout == "missing"
+
+    - name: Install elastic-agent with server components
+      ansible.builtin.command:
+        cmd: ./elastic-agent install --non-interactive --install-servers --force
+        chdir: "/var/tmp/elastic-agent-{{ elastic_version }}-linux-{{ tgz_arch }}"
+      when: fleet_server_check.stdout == "missing"
+
+    - name: Remove elastic-agent installer
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: absent
+      loop:
+        - "/var/tmp/elastic-agent-{{ elastic_version }}.tar.gz"
+        - "/var/tmp/elastic-agent-{{ elastic_version }}-linux-{{ tgz_arch }}"
+      when: fleet_server_check.stdout == "missing"
+
+    - name: Create certs directory
+      ansible.builtin.file:
+        path: /etc/elastic-agent/certs
+        state: directory
+        owner: root
+        group: root
+        mode: '0700'
+
+    - name: Copy CA certificate
+      ansible.builtin.copy:
+        src: "{{ certs_dir }}/ca.crt"
+        dest: /etc/elastic-agent/certs/ca.crt
+        owner: root
+        group: root
+        mode: '0600'
+      register: fleet_ca_cert
+
+    - name: Copy Fleet Server certificate
+      ansible.builtin.copy:
+        src: "{{ certs_dir }}/fleet.crt"
+        dest: /etc/elastic-agent/certs/fleet.crt
+        owner: root
+        group: root
+        mode: '0600'
+
+    - name: Copy Fleet Server private key
+      ansible.builtin.copy:
+        src: "{{ certs_dir }}/fleet.key"
+        dest: /etc/elastic-agent/certs/fleet.key
+        owner: root
+        group: root
+        mode: '0600'
+
+    - name: Stop elastic-agent for Fleet Server enrollment
+      ansible.builtin.systemd:
+        name: elastic-agent
+        state: stopped
+      failed_when: false
+
+    - name: Enroll elastic-agent as Fleet Server
+      ansible.builtin.command:
+        cmd: >
+          elastic-agent enroll
+          --url=https://{{ ansible_host }}:8220
+          --fleet-server-es=https://{{ hostvars['elasticsearch']['internal_ip'] | default(hostvars['elasticsearch']['ansible_host']) }}:9200
+          --fleet-server-service-token={{ hostvars['elasticsearch']['fleet_service_token'] }}
+          --fleet-server-policy={{ hostvars['kibana']['fleet_server_policy_id'] }}
+          --fleet-server-es-ca=/etc/elastic-agent/certs/ca.crt
+          --fleet-server-cert=/etc/elastic-agent/certs/fleet.crt
+          --fleet-server-cert-key=/etc/elastic-agent/certs/fleet.key
+          --certificate-authorities=/etc/elastic-agent/certs/ca.crt
+          --force
+      failed_when: false
+
+    - name: Start elastic-agent after Fleet Server enrollment
+      ansible.builtin.systemd:
+        name: elastic-agent
+        state: started
+
+    - name: Wait for Fleet Server to be ready
+      ansible.builtin.uri:
+        url: "https://{{ internal_ip | default(ansible_host) }}:8220/api/status"
+        timeout: 30
+        ca_path: /etc/elastic-agent/certs/ca.crt
+        return_content: true
+        status_code: [200]
+      register: fleet_status
+      until: fleet_status.status == 200 and fleet_status.json is defined and fleet_status.json.status == "HEALTHY"
+      retries: 30
+      delay: 10
+
+# Play 6: Install flog on elastic-agent VMs
+# flog has no arm64 release (github.com/mingrammer/flog ships linux/amd64
+# only), so instead of downloading it, the operator supplies a binary
+# matching each target VM's architecture via FLOG_BINARY_PATH in orca.env,
+# and it is copied here rather than fetched.
+- name: Install flog on elastic-agent VMs
+  hosts: elastic_agents
+  become: true
+  any_errors_fatal: true
+
+  tasks:
+    - name: Create flog log directory
+      ansible.builtin.file:
+        path: /var/log/flog
+        state: directory
+        owner: root
+        group: root
+        mode: '0755'
+
+    - name: Copy flog binary
+      ansible.builtin.copy:
+        src: "{{ flog_binary_path }}"
+        dest: /usr/local/bin/flog
+        owner: root
+        group: root
+        mode: '0755'
+
+# Play 7: Install and enroll elastic-agent on elastic-agent VMs
+- name: Install and enroll elastic-agent on elastic-agent VMs
+  hosts: elastic_agents
+  become: true
+  any_errors_fatal: true
+  vars_files: [vars.yml]
+
+  tasks:
+    - name: Check if elastic-agent is already installed
+      ansible.builtin.stat:
+        path: /opt/Elastic/Agent/elastic-agent
+      register: ea_installed
+
+    - name: Download elastic-agent tar.gz
+      ansible.builtin.get_url:
+        url: "https://artifacts.elastic.co/downloads/beats/elastic-agent/elastic-agent-{{ agent_version }}-linux-{{ tgz_arch }}.tar.gz"
+        dest: "/var/tmp/elastic-agent-{{ agent_version }}.tar.gz"
+        mode: '0644'
+        timeout: 300
+      when: not (agent_is_snapshot | bool) and not ea_installed.stat.exists
+
+    - name: Look up elastic-agent snapshot tar.gz URL
+      ansible.builtin.uri:
+        url: "{{ agent_artifacts_api }}/elastic-agent-{{ agent_version }}-linux-{{ tgz_arch }}.tar.gz"
+        timeout: 300
+        return_content: true
+      register: agent_artifact
+      delegate_to: localhost
+      run_once: true
+      become: false
+      when: (agent_is_snapshot | bool) and not ea_installed.stat.exists
+
+    - name: Download elastic-agent snapshot tar.gz
+      ansible.builtin.get_url:
+        url: "{{ agent_artifact.json.packages['elastic-agent-' + agent_version + '-linux-' + tgz_arch + '.tar.gz'].url }}"
+        dest: "/var/tmp/elastic-agent-{{ agent_version }}.tar.gz"
+        timeout: 300
+      register: agent_snapshot_tgz_dl
+      until: agent_snapshot_tgz_dl is succeeded
+      retries: 3
+      delay: 15
+      when: (agent_is_snapshot | bool) and not ea_installed.stat.exists
+
+    - name: Extract elastic-agent
+      ansible.builtin.unarchive:
+        src: "/var/tmp/elastic-agent-{{ agent_version }}.tar.gz"
+        dest: /var/tmp/
+        remote_src: true
+      when: not ea_installed.stat.exists
+
+    - name: Install elastic-agent
+      ansible.builtin.command:
+        cmd: ./elastic-agent install --non-interactive
+        chdir: "/var/tmp/elastic-agent-{{ agent_version }}-linux-{{ tgz_arch }}"
+      when: not ea_installed.stat.exists
+
+    - name: Remove elastic-agent installer
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: absent
+      loop:
+        - "/var/tmp/elastic-agent-{{ agent_version }}.tar.gz"
+        - "/var/tmp/elastic-agent-{{ agent_version }}-linux-{{ tgz_arch }}"
+      when: not ea_installed.stat.exists
+
+    - name: Create certs directory
+      ansible.builtin.file:
+        path: /etc/elastic-agent/certs
+        state: directory
+        owner: root
+        group: root
+        mode: '0700'
+
+    - name: Copy CA certificate
+      ansible.builtin.copy:
+        src: "{{ certs_dir }}/ca.crt"
+        dest: /etc/elastic-agent/certs/ca.crt
+        owner: root
+        group: root
+        mode: '0600'
+      register: agent_ca_cert
+
+    - name: Stop elastic-agent for enrollment
+      ansible.builtin.systemd:
+        name: elastic-agent
+        state: stopped
+      failed_when: false
+
+    - name: Enroll elastic-agent with Fleet
+      ansible.builtin.command:
+        cmd: >
+          elastic-agent enroll
+          --url=https://{{ hostvars['fleet_server']['internal_ip'] | default(hostvars['fleet_server']['ansible_host']) }}:8220
+          --enrollment-token={{ hostvars['kibana']['agent_monitoring_enrollment_token'] }}
+          --certificate-authorities=/etc/elastic-agent/certs/ca.crt
+          --force
+      failed_when: false
+
+    - name: Start elastic-agent after enrollment
+      ansible.builtin.systemd:
+        name: elastic-agent
+        state: started
+
+    - name: Read elastic-agent ID
+      ansible.builtin.shell: >
+        elastic-agent status --output json 2>/dev/null
+        | python3 -c 'import json,sys; print(json.load(sys.stdin)["info"]["id"])'
+      register: ea_id
+      retries: 30
+      delay: 5
+      until: ea_id.rc == 0 and (ea_id.stdout | trim | length) > 0
+      changed_when: false
+
+    - name: Record elastic-agent ID as host fact
+      ansible.builtin.set_fact:
+        elastic_agent_id: "{{ ea_id.stdout | trim }}"
+
+    - name: Check every agent VM recorded an elastic-agent ID
+      ansible.builtin.assert:
+        that: missing_agent_ids | length == 0
+        fail_msg: "No elastic-agent ID for {{ missing_agent_ids | join(', ') }}; check earlier task failures on those hosts"
+      vars:
+        missing_agent_ids: "{{ groups['elastic_agents'] | map('extract', hostvars) | selectattr('elastic_agent_id', 'undefined') | map(attribute='inventory_hostname') | list }}"
+      run_once: true
+      delegate_to: localhost
+      become: false
+      when: agent_ids_file is defined
+
+    - name: Write elastic-agent IDs for orca
+      ansible.builtin.copy:
+        dest: "{{ agent_ids_file }}"
+        mode: '0644'
+        content: >-
+          {{ dict(groups['elastic_agents']
+             | zip(groups['elastic_agents'] | map('extract', hostvars, 'elastic_agent_id')))
+             | to_nice_json }}
+      run_once: true
+      delegate_to: localhost
+      become: false
+      when: agent_ids_file is defined
+
+# Play 8: Install and enroll elastic-agent on Elasticsearch VM
+- name: Install and enroll elastic-agent on Elasticsearch VM
+  hosts: elasticsearch
+  become: true
+  any_errors_fatal: true
+  vars_files: [vars.yml]
+
+  tasks:
+    - name: Check if elastic-agent is already installed
+      ansible.builtin.stat:
+        path: /opt/Elastic/Agent/elastic-agent
+      register: ea_installed
+
+    - name: Remove spurious elastic-agent dpkg record (created by apt-mark hold on uninstalled package)
+      ansible.builtin.shell: >
+        dpkg --purge elastic-agent 2>/dev/null || true
+      changed_when: false
+      when: not ea_installed.stat.exists
+
+    - name: Download elastic-agent tar.gz
+      ansible.builtin.get_url:
+        url: "https://artifacts.elastic.co/downloads/beats/elastic-agent/elastic-agent-{{ agent_version }}-linux-{{ tgz_arch }}.tar.gz"
+        dest: "/var/tmp/elastic-agent-{{ agent_version }}.tar.gz"
+        mode: '0644'
+        timeout: 300
+      when: not (agent_is_snapshot | bool) and not ea_installed.stat.exists
+
+    - name: Look up elastic-agent snapshot tar.gz URL
+      ansible.builtin.uri:
+        url: "{{ agent_artifacts_api }}/elastic-agent-{{ agent_version }}-linux-{{ tgz_arch }}.tar.gz"
+        timeout: 300
+        return_content: true
+      register: agent_artifact
+      delegate_to: localhost
+      run_once: true
+      become: false
+      when: (agent_is_snapshot | bool) and not ea_installed.stat.exists
+
+    - name: Download elastic-agent snapshot tar.gz
+      ansible.builtin.get_url:
+        url: "{{ agent_artifact.json.packages['elastic-agent-' + agent_version + '-linux-' + tgz_arch + '.tar.gz'].url }}"
+        dest: "/var/tmp/elastic-agent-{{ agent_version }}.tar.gz"
+        timeout: 300
+      register: agent_snapshot_tgz_dl
+      until: agent_snapshot_tgz_dl is succeeded
+      retries: 3
+      delay: 15
+      when: (agent_is_snapshot | bool) and not ea_installed.stat.exists
+
+    - name: Extract elastic-agent
+      ansible.builtin.unarchive:
+        src: "/var/tmp/elastic-agent-{{ agent_version }}.tar.gz"
+        dest: /var/tmp/
+        remote_src: true
+      when: not ea_installed.stat.exists
+
+    - name: Install elastic-agent
+      ansible.builtin.command:
+        cmd: ./elastic-agent install --non-interactive
+        chdir: "/var/tmp/elastic-agent-{{ agent_version }}-linux-{{ tgz_arch }}"
+      when: not ea_installed.stat.exists
+
+    - name: Remove elastic-agent installer
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: absent
+      loop:
+        - "/var/tmp/elastic-agent-{{ agent_version }}.tar.gz"
+        - "/var/tmp/elastic-agent-{{ agent_version }}-linux-{{ tgz_arch }}"
+      when: not ea_installed.stat.exists
+
+    - name: Create certs directory
+      ansible.builtin.file:
+        path: /etc/elastic-agent/certs
+        state: directory
+        owner: root
+        group: root
+        mode: '0700'
+
+    - name: Copy CA certificate
+      ansible.builtin.copy:
+        src: "{{ certs_dir }}/ca.crt"
+        dest: /etc/elastic-agent/certs/ca.crt
+        owner: root
+        group: root
+        mode: '0600'
+      register: es_agent_ca_cert
+
+    - name: Stop elastic-agent for enrollment
+      ansible.builtin.systemd:
+        name: elastic-agent
+        state: stopped
+      failed_when: false
+
+    - name: Enroll elastic-agent with Fleet (es_metrics policy)
+      ansible.builtin.command:
+        cmd: >
+          elastic-agent enroll
+          --url=https://{{ hostvars['fleet_server']['internal_ip'] | default(hostvars['fleet_server']['ansible_host']) }}:8220
+          --enrollment-token={{ hostvars['kibana']['es_metrics_enrollment_token'] }}
+          --certificate-authorities=/etc/elastic-agent/certs/ca.crt
+          --force
+      failed_when: false
+
+    - name: Start elastic-agent after enrollment
+      ansible.builtin.systemd:
+        name: elastic-agent
+        state: started

@@ -1,0 +1,7 @@
+*.org
+*.csv
+elastic-agent-managed-kubernetes.yml
+*.tar.gz
+run-*
+.DS_Store
+orca.env

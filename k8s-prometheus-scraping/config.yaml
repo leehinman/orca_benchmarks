@@ -1,0 +1,135 @@
+benchmark:
+  name: k8s-prometheus-scraping
+
+# Defaults for ${NAME} knobs; override in orca.env next to this file (see
+# README). ES_URL and ES_PASSWORD are not declared on purpose: declared
+# variables are printed in every summary.txt, and leaving them undeclared makes
+# orca fail fast when they are missing.
+variables:
+  ES_USER: elastic
+  AGENT_IMAGE: elastic-agent-9.6.0-SNAPSHOT-linux-arm64.docker.tar.gz
+
+elasticsearch:
+  url:      ${ES_URL}
+  username: ${ES_USER}
+  password: ${ES_PASSWORD}
+
+phases:
+
+  # ── Setup ────────────────────────────────────────────────────────────────────
+  setup:
+    - id: cluster
+      kind:
+        name: bench
+        outputs:
+          kubeconfigPath: { from: file, path: "${scratch}/kubeconfig" }
+
+  # ── Configure ────────────────────────────────────────────────────────────────
+  # 1. Installs metrics-server.
+  # 2. Patches it to trust kind's self-signed kubelet certificates.
+  # 3. Waits for metrics-server to be Ready.
+  # 4. Installs kube-state-metrics.
+  # 5. Waits for kube-state-metrics to be Ready.
+  # 6. Deploys Fleet-enrolled elastic-agent and waits for its pods to be Ready.
+  #
+  # elastic-agent-managed-kubernetes.yml must be generated from the Kibana Fleet UI
+  # using a policy that includes the Prometheus integration with per-pod autodiscovery
+  # (stream ID templated on ${kubernetes.pod.name} so each new pod triggers a config
+  # reload — that is the behaviour under test).
+  configure:
+    - kind-load:
+        name:  ${steps.cluster.name}
+        image: ${AGENT_IMAGE}
+
+    - id: metrics-server
+      kubectl:
+        kubeconfig: ${steps.cluster.kubeconfigPath}
+        run: apply -f https://github.com/kubernetes-sigs/metrics-server/releases/latest/download/components.yaml
+
+    - id: metrics-server-patch
+      kubectl:
+        kubeconfig: ${steps.cluster.kubeconfigPath}
+        run: >-
+          patch deployment metrics-server
+          -n kube-system
+          --type=json
+          -p='[{"op":"add","path":"/spec/template/spec/containers/0/args/-","value":"--kubelet-insecure-tls"}]'
+
+    - id: metrics-server-wait
+      kubectl:
+        kubeconfig: ${steps.cluster.kubeconfigPath}
+        run: rollout status deployment/metrics-server -n kube-system --timeout=10m
+
+    - kubectl:
+        kubeconfig: ${steps.cluster.kubeconfigPath}
+        run: apply -k https://github.com/kubernetes/kube-state-metrics//examples/standard
+
+    - wait-pods:
+        kubeconfig: ${steps.cluster.kubeconfigPath}
+        namespace:  kube-system
+        selector:   app.kubernetes.io/name=kube-state-metrics
+        timeout:    3m
+
+    - kubectl:
+        kubeconfig: ${steps.cluster.kubeconfigPath}
+        run: apply -f ./elastic-agent-managed-kubernetes.yml
+
+    - wait-pods:
+        kubeconfig: ${steps.cluster.kubeconfigPath}
+        namespace:  kube-system
+        selector:   app.kubernetes.io/name=elastic-agent
+        timeout:    5m
+
+  # ── Warmup ───────────────────────────────────────────────────────────────────
+  # Waits until elastic-agent has shipped at least 4 memory metric documents,
+  # confirming agent self-monitoring is active before the execute phase begins.
+  warmup:
+    - es-doc-count:
+        index:    metrics-*
+        since:    ${phase.warmup.start}
+        filter:
+          data_stream.dataset: elastic_agent.elastic_agent
+          component.id:        elastic-agent
+          host.hostname:       bench-control-plane
+        expected: 4
+        timeout:  5m
+
+  # ── Execute ──────────────────────────────────────────────────────────────────
+  # Starts the emitter Job (6000 pods × 50 parallelism, each alive for 10 s)
+  # and waits until all completions finish (~20 minutes).
+  execute:
+    - kubectl:
+        kubeconfig: ${steps.cluster.kubeconfigPath}
+        run: apply -f ./emitter.yaml
+
+    - watch-job:
+        kubeconfig: ${steps.cluster.kubeconfigPath}
+        namespace:  default
+        job:        emitter
+
+  # ── Collect ──────────────────────────────────────────────────────────────────
+  # Queries agent resource metrics over the full execute window for three
+  # components: elastic-agent, elastic-otel-collector, and metricbeat.
+  # cpu_pct uses system.process.cpu.total.pct (0–1 fraction of one core).
+  collect:
+
+    # ── process metrics timeseries + charts for all components ───────────────
+    - id: agent-metrics
+      elastic-agent-metrics:
+        since: ${phase.execute.start}
+        until: ${phase.collect.start}
+        output_dir: ${results}
+        integrations: [prometheus/metrics-default]
+        ingest:
+          - name:  prometheus
+            index: metrics-prometheus-*
+        agents:
+          - id:    agent
+            label: "elastic-agent — prometheus scraping bench"
+            filter:
+              host.hostname: bench-control-plane
+
+  # ── Teardown ─────────────────────────────────────────────────────────────────
+  teardown:
+    - kind-delete:
+        name: ${steps.cluster.name}

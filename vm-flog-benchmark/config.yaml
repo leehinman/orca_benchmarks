@@ -1,0 +1,258 @@
+benchmark:
+  name: vm-flog-benchmark
+
+# Defaults for every ${NAME} knob below. Override in orca.env next to this
+# file (or --env-file, or the process environment); see README "Variables".
+# ORCA_PROVIDER and TF_VAR_* must stay the same for up, bench, and down.
+# TF_VAR_agent_count is the number of elastic-agent VMs provisioned (1, 2, 4,
+# or 8). The tofu modules support 0-8.
+# ACTIVE_AGENT_COUNT is how many of those VMs run in a bench (the first N);
+# the rest are stopped at warmup. It must be <= TF_VAR_agent_count, so up with
+# 8 and vary this per bench to compare 8, 4, 2, and 1 agents on one cluster.
+# FLOG_FILE_COUNT and FLOG_LINES_PER_FILE control each bench's log burst,
+# generated fresh on every agent VM at warmup.
+# AGENT_METRICS_PERIOD is the elastic-agent self-monitoring sample interval,
+# set on the agent policy at up.
+# FLOG_BINARY_PATH (local path to a flog binary matching the agent VMs'
+# architecture) is required but deliberately undeclared here, so orca fails
+# fast if it isn't set rather than silently using some default.
+variables:
+  ORCA_PROVIDER: multipass
+  TF_VAR_agent_count: "4"
+  ACTIVE_AGENT_COUNT: "4"
+  ELASTIC_VERSION: 9.6.0-SNAPSHOT
+  AGENT_VERSION: 9.2.8
+  AGENT_METRICS_PERIOD: 15s
+  FLOG_FILE_COUNT: "5"
+  FLOG_LINES_PER_FILE: "1000"
+  FLOG_FORMAT: apache_common
+
+elasticsearch:
+  url: "https://${steps.infra.elasticsearch_ip}:9200"
+  username: "elastic"
+  password: "changeme"
+  ca_path: "${scratch}/../certs/ca.crt"
+
+kibana:
+  url: "https://${steps.infra.kibana_ip}:5601"
+  username: "elastic"
+  password: "changeme"
+  ca_path: "${scratch}/../certs/ca.crt"
+
+phases:
+
+  # ── Setup ────────────────────────────────────────────────────────────────────
+  # Provisions VMs with OpenTofu using the module selected by ORCA_PROVIDER
+  # (multipass or gcp) and captures the address the operator uses (*_ip), the
+  # address VMs use for each other (*_internal_ip), and the agent hostnames.
+  # Indexed outputs past TF_VAR_agent_count resolve to "", and the !repeat
+  # blocks below only reference indices under the count. elastic_agent_ips is
+  # the space-joined list of operator addresses for the warmup shell loop.
+  # The SSH public key is read from ~/.ssh/id_rsa_yubikey.pub by default;
+  # override with TF_VAR_ssh_public_key_file. See README for the GCP
+  # variables. Unlike vm-benchmark, there are no generator VMs: flog runs
+  # directly on each elastic-agent VM.
+  setup:
+    - id: infra
+      opentofu:
+        dir: ./tofu/${ORCA_PROVIDER}
+        outputs:
+          elasticsearch_ip: {}
+          elasticsearch_internal_ip: {}
+          kibana_ip: {}
+          kibana_internal_ip: {}
+          fleet_server_ip: {}
+          fleet_server_internal_ip: {}
+          elastic_agent_ips: {}
+          elastic_agent_ip_0: {}
+          elastic_agent_ip_1: {}
+          elastic_agent_ip_2: {}
+          elastic_agent_ip_3: {}
+          elastic_agent_ip_4: {}
+          elastic_agent_ip_5: {}
+          elastic_agent_ip_6: {}
+          elastic_agent_ip_7: {}
+          elastic_agent_internal_ip_0: {}
+          elastic_agent_internal_ip_1: {}
+          elastic_agent_internal_ip_2: {}
+          elastic_agent_internal_ip_3: {}
+          elastic_agent_internal_ip_4: {}
+          elastic_agent_internal_ip_5: {}
+          elastic_agent_internal_ip_6: {}
+          elastic_agent_internal_ip_7: {}
+          elastic_agent_hostname_0: {}
+          elastic_agent_hostname_1: {}
+          elastic_agent_hostname_2: {}
+          elastic_agent_hostname_3: {}
+          elastic_agent_hostname_4: {}
+          elastic_agent_hostname_5: {}
+          elastic_agent_hostname_6: {}
+          elastic_agent_hostname_7: {}
+
+  # ── Configure ────────────────────────────────────────────────────────────────
+  # Writes a dynamic Ansible inventory from the provisioned IPs, then runs the
+  # playbook to install and configure software on all VMs. The playbook writes
+  # the Fleet agent ID of each enrolled agent to agent-ids.json, exposed as
+  # ${steps.provision.<inventory-host>} for the collect phase.
+  configure:
+    - write-ini:
+        output: ${scratch}/inventory.ini
+        sections:
+          - name: elasticsearch
+            entries:
+              - elasticsearch ansible_host=${steps.infra.elasticsearch_ip} internal_ip=${steps.infra.elasticsearch_internal_ip}
+          - name: kibana
+            entries:
+              - kibana ansible_host=${steps.infra.kibana_ip} internal_ip=${steps.infra.kibana_internal_ip}
+          - name: fleet_server
+            entries:
+              - fleet_server ansible_host=${steps.infra.fleet_server_ip} internal_ip=${steps.infra.fleet_server_internal_ip}
+          - name: elastic_agents
+            entries: !repeat
+              count: ${TF_VAR_agent_count}
+              as: i
+              template: "agent${i} ansible_host=${steps.infra.elastic_agent_ip_${i}} internal_ip=${steps.infra.elastic_agent_internal_ip_${i}}"
+
+    - id: provision
+      ansible:
+        playbook: ./ansible/playbook.yml
+        inventory: ${scratch}/inventory.ini
+        requirements: ./ansible/requirements.yml
+        vars:
+          elastic_version: "${ELASTIC_VERSION}"
+          agent_version: "${AGENT_VERSION}"
+          agent_metrics_period: "${AGENT_METRICS_PERIOD}"
+          certs_dir: "${scratch}/../certs"
+          agent_ids_file: "${scratch}/agent-ids.json"
+          flog_binary_path: "${FLOG_BINARY_PATH}"
+        outputs:
+          from: file
+          path: ${scratch}/agent-ids.json
+
+  # ── Warmup ───────────────────────────────────────────────────────────────────
+  # On each agent VM: stops elastic-agent, clears last bench's log files
+  # (releasing any tracked file handles for a clean slate), generates
+  # FLOG_FILE_COUNT fresh files of FLOG_LINES_PER_FILE lines each with flog —
+  # all of it, as fast as possible, before elastic-agent ever starts — then
+  # starts elastic-agent so filestream reads the whole batch at once. That
+  # burst-read is the thing this benchmark measures; nothing here should pace
+  # or spread it out. All agents run concurrently (backgrounded with `&`,
+  # joined with `wait`) so one agent's generation time can't delay another's
+  # start. Agents past ACTIVE_AGENT_COUNT are only stopped, and stay offline.
+  warmup:
+    - shell:
+        timeout: 5m
+        run: |
+          n=0
+          for ip in ${steps.infra.elastic_agent_ips}; do
+            if [ $n -ge ${ACTIVE_AGENT_COUNT} ]; then
+              ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -o ConnectTimeout=20 ubuntu@$ip 'sudo systemctl stop elastic-agent' &
+              n=$((n+1))
+              continue
+            fi
+            n=$((n+1))
+            ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -o ConnectTimeout=20 ubuntu@$ip '
+              sudo systemctl stop elastic-agent
+              sudo rm -f /var/log/flog/*.log
+              sudo flog -n $(( ${FLOG_FILE_COUNT} * ${FLOG_LINES_PER_FILE} )) -p ${FLOG_LINES_PER_FILE} -t log -f ${FLOG_FORMAT} -o /var/log/flog/generated.log
+              sudo systemctl start elastic-agent
+              echo "$(hostname): generated ${FLOG_FILE_COUNT} files x ${FLOG_LINES_PER_FILE} lines"' &
+          done
+          wait
+
+  # ── Execute ──────────────────────────────────────────────────────────────────
+  # The 10s wait is a settling buffer, not a property of the data: it gives
+  # Elasticsearch time to reach steady state and the agent time to have sent
+  # several bulk batches before the doc-count gate starts evaluating anything.
+  # That gate then polls until every line generated at warmup has been
+  # ingested (ACTIVE_AGENT_COUNT * FLOG_FILE_COUNT * FLOG_LINES_PER_FILE
+  # documents in logs-flog-default). It counts from warmup.start, not
+  # execute.start: each agent VM starts elastic-agent as soon as its own
+  # generation finishes, so the first agent ships documents while the others
+  # are still generating, and those land before execute.start. Counting from
+  # execute.start would exclude them and the gate could never reach expected.
+  # Files are deleted and regenerated at warmup, so every document for this
+  # bench is newer than warmup.start. Both steps live here rather than in
+  # warmup so the elastic-agent-metrics window below (execute.start -
+  # collect.start) spans the ingestion burst without the stopped-agent gap.
+  execute:
+    - wait:
+        duration: 10s
+
+    - id: ingest-count
+      es-doc-count:
+        index: logs-flog-default
+        since: ${phase.warmup.start}
+        expected: ${ACTIVE_AGENT_COUNT}*${FLOG_FILE_COUNT}*${FLOG_LINES_PER_FILE}
+        timeout: 15m
+
+  # ── Collect ──────────────────────────────────────────────────────────────────
+  # Requests a diagnostics bundle from each agent via the Kibana Fleet API and
+  # downloads the zips, then fetches elastic-agent process metrics (memory,
+  # CPU) and output event rates for each agent VM over the execute window,
+  # producing TSV files and charts.
+  collect:
+
+    # ── stack versions ────────────────────────────────────────────────────────
+    # Queries Elasticsearch, Kibana, and Fleet for the versions actually
+    # running, since components can be upgraded between bench runs.
+    - id: versions
+      stack-versions: {}
+
+    # ── elastic-agent diagnostics bundles ─────────────────────────────────────
+    # Agent IDs come from the provision step; set hostname instead of id to
+    # look an agent up in Fleet by its enrolled hostname.
+    - id: agent-diagnostics
+      fleet-agent-diagnostics:
+        output_dir: ${results}
+        timeout: 10m
+        cpu_profile: true
+        agents: !repeat
+          count: ${ACTIVE_AGENT_COUNT}
+          as: i
+          template:
+            name: agent${i}
+            id: ${steps.provision.agent${i}}
+
+    # ── elastic-agent process metrics + output event rates ───────────────────
+    - id: agent-metrics
+      elastic-agent-metrics:
+        index: metrics-*
+        since: ${phase.execute.start}
+        until: ${phase.collect.start}
+        output_dir: ${results}
+        # PNG of the Elastic Agent metrics dashboard per agent, filtered by the
+        # agent's filter over the same window; needs the kibana: block above.
+        dashboard: {}
+        agents: !repeat
+          count: ${ACTIVE_AGENT_COUNT}
+          as: i
+          template:
+            id:    agent${i}
+            label: ${steps.infra.elastic_agent_hostname_${i}}
+            component_ids:
+              - elastic-agent
+              - elastic-otel-collector
+              - filestream
+            filter:
+              agent.name: ${steps.infra.elastic_agent_hostname_${i}}
+
+    # ── Elasticsearch node metrics + per-data-stream event rates ──────────
+    # Node stats (indexing rate, CPU, heap) as TSV + charts, plus a document
+    # count per data stream over the execute window and the resulting
+    # observed events/sec.
+    - id: es-metrics
+      elasticsearch-metrics:
+        since: ${phase.execute.start}
+        until: ${phase.collect.start}
+        output_dir: ${results}
+
+  # ── Report ───────────────────────────────────────────────────────────────────
+  # All charts are produced in collect; nothing to render here.
+  report: []
+
+  # ── Teardown ─────────────────────────────────────────────────────────────────
+  teardown:
+    - opentofu:
+        dir: ./tofu/${ORCA_PROVIDER}
+        destroy: true

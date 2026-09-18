@@ -1,0 +1,14 @@
+[Unit]
+Description=Log generator
+After=network.target
+
+[Service]
+Type=simple
+Environment=RATE=500
+EnvironmentFile=-/etc/default/loggen
+ExecStart=/usr/bin/loggen --quiet --rate=${RATE} --inet --stream --permanent --read-file=/etc/loggen/cef.log --loop-reading --dont-parse {{ agent_internal_ip }} 9514
+StandardOutput=null
+OOMScoreAdjust=1000
+
+[Install]
+WantedBy=multi-user.target

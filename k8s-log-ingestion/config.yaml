@@ -1,0 +1,144 @@
+benchmark:
+  name: k8s-log-ingestion
+
+# Defaults for ${NAME} knobs; override in orca.env next to this file (see
+# README). ES_URL and ES_PASSWORD are not declared on purpose: declared
+# variables are printed in every summary.txt, and leaving them undeclared makes
+# orca fail fast when they are missing.
+variables:
+  ES_USER: elastic
+  AGENT_IMAGE: elastic-agent-9.6.0-SNAPSHOT-linux-arm64.docker.tar.gz
+
+elasticsearch:
+  url:      ${ES_URL}
+  username: ${ES_USER}
+  password: ${ES_PASSWORD}
+
+phases:
+
+  # ── Setup ────────────────────────────────────────────────────────────────────
+  setup:
+    - id: cluster
+      kind:
+        name: bench
+        outputs:
+          kubeconfigPath: { from: file, path: "${scratch}/kubeconfig" }
+
+  # ── Configure ────────────────────────────────────────────────────────────────
+  # 1. Loads the agent image into the kind cluster.
+  # 2. Installs metrics-server and patches it to trust kind's self-signed kubelet certs.
+  # 3. Waits for metrics-server rollout to complete.
+  # 4. Installs kube-state-metrics and waits for its pods to be Ready.
+  # 5. Deploys Fleet-enrolled elastic-agent and waits for its pods to be Ready.
+  #
+  # elastic-agent-managed-kubernetes.yml must be generated from the Kibana Fleet UI:
+  #   Fleet → Agent policies → <your policy> → Add agent → Kubernetes
+  configure:
+    - kind-load:
+        name:  ${steps.cluster.name}
+        image: ${AGENT_IMAGE}
+
+    - id: metrics-server
+      kubectl:
+        kubeconfig: ${steps.cluster.kubeconfigPath}
+        run: apply -f https://github.com/kubernetes-sigs/metrics-server/releases/latest/download/components.yaml
+
+    - id: metrics-server-patch
+      kubectl:
+        kubeconfig: ${steps.cluster.kubeconfigPath}
+        run: >-
+          patch deployment metrics-server
+          -n kube-system
+          --type=json
+          -p='[{"op":"add","path":"/spec/template/spec/containers/0/args/-","value":"--kubelet-insecure-tls"}]'
+
+    - id: metrics-server-wait
+      kubectl:
+        kubeconfig: ${steps.cluster.kubeconfigPath}
+        run: rollout status deployment/metrics-server -n kube-system --timeout=10m
+
+    - kubectl:
+        kubeconfig: ${steps.cluster.kubeconfigPath}
+        run: apply -k https://github.com/kubernetes/kube-state-metrics//examples/standard
+
+    - wait-pods:
+        kubeconfig: ${steps.cluster.kubeconfigPath}
+        namespace:  kube-system
+        selector:   app.kubernetes.io/name=kube-state-metrics
+        timeout:    3m
+
+    - kubectl:
+        kubeconfig: ${steps.cluster.kubeconfigPath}
+        run: apply -f ./elastic-agent-managed-kubernetes.yml
+
+    - wait-pods:
+        kubeconfig: ${steps.cluster.kubeconfigPath}
+        namespace:  kube-system
+        selector:   app.kubernetes.io/name=elastic-agent
+        timeout:    5m
+
+  # ── Warmup ───────────────────────────────────────────────────────────────────
+  # Waits until elastic-agent has shipped at least 4 memory metric documents,
+  # confirming agent self-monitoring is active before the execute phase begins.
+  warmup:
+    - es-doc-count:
+        index:    metrics-*
+        since:    ${phase.warmup.start}
+        filter:
+          data_stream.dataset: elastic_agent.elastic_agent
+          component.id:        elastic-agent
+          host.hostname:       bench-control-plane
+        expected: 4
+        timeout:  5m
+
+  # ── Execute ──────────────────────────────────────────────────────────────────
+  # Starts the emitter Job and waits until all 1600 completions finish.
+  # phase.execute.start becomes the lower-bound timestamp for ES queries in Collect.
+  execute:
+    - kubectl:
+        kubeconfig: ${steps.cluster.kubeconfigPath}
+        run: apply -f ./emitter.yaml
+
+    - watch-job:
+        kubeconfig: ${steps.cluster.kubeconfigPath}
+        namespace:  default
+        job:        emitter
+
+  # ── Collect ──────────────────────────────────────────────────────────────────
+  # 1. Polls ES until 48 000 container-log documents appear (1600 pods × 30 lines).
+  # 2. Queries agent resource metrics over the full execute window for three
+  #    components: elastic-agent, elastic-otel-collector, and filestream.
+  collect:
+
+    # ── log ingestion count ──────────────────────────────────────────────────
+    - id: log-count
+      es-doc-count:
+        index:    logs-kubernetes.container_logs-*
+        since:    ${phase.execute.start}
+        filter:
+          log.file.path: /var/log/containers/emitter-*
+        expected: 48000
+        timeout:  10m
+
+    # ── process metrics timeseries + charts for all components ───────────────
+    - id: agent-metrics
+      elastic-agent-metrics:
+        since: ${phase.execute.start}
+        until: ${phase.collect.start}
+        output_dir: ${results}
+        integrations: [filestream/logs-default]
+        ingest:
+          - name:  filestream
+            index: logs-kubernetes.container_logs-*
+            filter:
+              log.file.path: /var/log/containers/emitter-*
+        agents:
+          - id:    agent
+            label: "elastic-agent — log ingestion bench"
+            filter:
+              host.hostname: bench-control-plane
+
+  # ── Teardown ─────────────────────────────────────────────────────────────────
+  teardown:
+    - kind-delete:
+        name: ${steps.cluster.name}

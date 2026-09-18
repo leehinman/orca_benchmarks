@@ -1,0 +1,6 @@
+ansible_user: ubuntu
+ansible_ssh_common_args: '-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR'
+
+elastic_password: "changeme"
+kibana_encryption_key: "b4d3a2c1e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d2e3f4a5b6c7d8e9f0a1b2"
+kibana_reporting_encryption_key: "7c1e9a4d2f8b6053e1a7c9d4b2f6e8a0c3d5f7b9e1a3c5d7f9b1e3a5c7d9f1b3"

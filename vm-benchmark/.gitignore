@@ -1,0 +1,6 @@
+/tofu/*/.terraform*
+/tofu/*/terraform.tfstate
+/tofu/*/terraform.tfstate.backup
+/tofu/*/cloud-init.yaml
+run-*/
+/orca.env

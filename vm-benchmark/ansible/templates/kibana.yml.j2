@@ -1,0 +1,23 @@
+server.port: 5601
+server.host: "0.0.0.0"
+server.name: "kibana"
+
+server.ssl.enabled: true
+server.ssl.key: /etc/kibana/certs/kibana.key
+server.ssl.certificate: /etc/kibana/certs/kibana.crt
+
+xpack.encryptedSavedObjects.encryptionKey: "{{ kibana_encryption_key }}"
+xpack.reporting.encryptionKey: "{{ kibana_reporting_encryption_key }}"
+xpack.reporting.queue.timeout: 15m
+xpack.reporting.capture.maxAttempts: 1
+xpack.screenshotting.browser.chromium.disableSandbox: true
+xpack.screenshotting.capture.timeouts.openUrl: 3m
+xpack.screenshotting.capture.timeouts.waitForElements: 3m
+xpack.screenshotting.capture.timeouts.renderComplete: 8m
+
+xpack.fleet.experimentalFeatures:
+  installIntegrationsKnowledge: false
+
+elasticsearch.hosts: ["https://{{ hostvars['elasticsearch']['internal_ip'] | default(hostvars['elasticsearch']['ansible_host']) }}:9200"]
+elasticsearch.serviceAccountToken: "{{ hostvars['elasticsearch']['kibana_service_token'] }}"
+elasticsearch.ssl.certificateAuthorities: ["/etc/kibana/certs/ca.crt"]

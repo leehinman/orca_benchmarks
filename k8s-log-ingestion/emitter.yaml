@@ -1,0 +1,32 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: emitter
+  namespace: default
+spec:
+  # 1600 completions × 30 lines per pod = 48 000 log events total.
+  # Matches the expected count in config.yaml.
+  completions:  1600
+  parallelism:  10
+  template:
+    metadata:
+      labels:
+        app: emitter
+    spec:
+      containers:
+        - name: emitter
+          image: busybox:stable
+          imagePullPolicy: IfNotPresent
+          command:
+            - sh
+            - -c
+            - |
+              for i in $(seq 1 30); do
+                echo "bench log line $i host=$HOSTNAME ts=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+                sleep 0.1
+              done
+      restartPolicy: Never
+  # No retries: the shell script is trivial and should never fail.
+  # A pod failure with backoffLimit=0 surfaces the problem immediately
+  # rather than masking it with retries that inflate the log count.
+  backoffLimit: 0
