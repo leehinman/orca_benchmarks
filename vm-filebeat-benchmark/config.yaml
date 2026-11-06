@@ -1,0 +1,115 @@
+benchmark:
+  name: vm-filebeat-benchmark
+
+# Defaults for every ${NAME} knob below. Override in orca.env next to this
+# file (or --env-file, or the process environment); see README "Variables".
+# ORCA_PROVIDER and TF_VAR_* must stay the same for up, bench, and down.
+# FLOG_FILE_COUNT and FLOG_LINES_PER_FILE size each bench's log burst. Keep it
+# large: filebeat reads it in seconds and the monitoring period is 5s, so a
+# small burst leaves too few samples for constant rates.
+# ES_URL, ES_USER, ES_PASSWORD (the remote Elasticsearch that receives
+# filebeat's monitoring data; ES_URL needs an explicit port, e.g. :443) and
+# FLOG_BINARY_PATH are deliberately undeclared so orca fails fast if they
+# aren't set, and so the password never appears in summary.txt.
+# FILEBEAT_TARBALL_PATH is an optional local filebeat tar.gz; when empty,
+# FILEBEAT_VERSION is downloaded.
+variables:
+  ORCA_PROVIDER: multipass
+  FILEBEAT_VERSION: 9.5.6
+  FLOG_FILE_COUNT: "10"
+  FLOG_LINES_PER_FILE: "500000"
+  FLOG_FORMAT: apache_common
+
+elasticsearch:
+  url: "${ES_URL}"
+  username: "${ES_USER}"
+  password: "${ES_PASSWORD}"
+
+phases:
+
+  # ── Setup ────────────────────────────────────────────────────────────────────
+  # Provisions the single agent VM with OpenTofu using the module selected by
+  # ORCA_PROVIDER (multipass or gcp).
+  setup:
+    - id: infra
+      opentofu:
+        dir: ./tofu/${ORCA_PROVIDER}
+        outputs:
+          agent_ip: {}
+          agent_internal_ip: {}
+          agent_hostname: {}
+
+  # ── Configure ────────────────────────────────────────────────────────────────
+  # Writes a one-host inventory, then installs flog and filebeat (discard
+  # output, monitoring to the remote Elasticsearch) on the agent VM. The
+  # playbook first checks that the remote cluster has
+  # xpack.monitoring.collection.enabled set, since otherwise it silently drops
+  # the monitoring data. filebeat is installed but not started.
+  configure:
+    - write-ini:
+        output: ${scratch}/inventory.ini
+        sections:
+          - name: filebeat_agents
+            entries:
+              - agent ansible_host=${steps.infra.agent_ip} internal_ip=${steps.infra.agent_internal_ip}
+
+    - id: provision
+      ansible:
+        playbook: ./ansible/playbook.yml
+        inventory: ${scratch}/inventory.ini
+        vars:
+          filebeat_version: "${FILEBEAT_VERSION}"
+          filebeat_tarball_path: "${FILEBEAT_TARBALL_PATH:-}"
+          flog_binary_path: "${FLOG_BINARY_PATH}"
+
+  # ── Warmup ───────────────────────────────────────────────────────────────────
+  # Stops filebeat, clears the previous bench's files and registry, generates
+  # the whole burst with flog before filebeat starts, then starts filebeat so
+  # filestream reads it all at once. The started gate confirms monitoring
+  # documents reach Elasticsearch and the discard output is acking events,
+  # counting only samples from the filebeat process started after warmup began.
+  warmup:
+    - shell:
+        timeout: 15m
+        run: |
+          ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -o ConnectTimeout=20 ubuntu@${steps.infra.agent_ip} '
+            sudo systemctl stop filebeat
+            sudo rm -f /var/log/flog/*.log
+            sudo rm -rf /var/lib/filebeat/*
+            sudo flog -n $(( ${FLOG_FILE_COUNT} * ${FLOG_LINES_PER_FILE} )) -p ${FLOG_LINES_PER_FILE} -t log -f ${FLOG_FORMAT} -o /var/log/flog/generated.log
+            sudo systemctl start filebeat
+            echo "generated ${FLOG_FILE_COUNT} files x ${FLOG_LINES_PER_FILE} lines"'
+
+    - id: started
+      filebeat-wait:
+        since: ${phase.warmup.start}
+        timeout: 5m
+
+  # ── Execute ──────────────────────────────────────────────────────────────────
+  # Polls every 5s until the discard output has acked every line flog
+  # generated, or the timeout. reachedAt is the timestamp of the first sample
+  # at that count; collect stops just before it.
+  execute:
+    - id: gate
+      filebeat-wait:
+        since: ${phase.warmup.start}
+        expected: ${FLOG_FILE_COUNT}*${FLOG_LINES_PER_FILE}
+        timeout: 30m
+
+  # ── Collect ──────────────────────────────────────────────────────────────────
+  # filebeat CPU, memory, and output events/s from warmup start to the sample
+  # before completion, so the partial final interval is excluded.
+  collect:
+    - id: filebeat
+      filebeat-metrics:
+        since: ${phase.warmup.start}
+        until: ${steps.gate.reachedAt}
+        output_dir: ${results}
+
+  report: []
+
+  # ── Teardown ─────────────────────────────────────────────────────────────────
+  teardown:
+    - opentofu:
+        dir: ./tofu/${ORCA_PROVIDER}
+        destroy: true

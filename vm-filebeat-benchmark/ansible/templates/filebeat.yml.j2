@@ -1,0 +1,15 @@
+filebeat.inputs:
+  - type: filestream
+    id: flog
+    paths:
+      - {{ flog_dir }}/*.log
+
+output.discard:
+  enabled: true
+
+monitoring.enabled: true
+monitoring.elasticsearch:
+  hosts: [{{ es_url | to_json }}]
+  username: {{ es_user | to_json }}
+  password: {{ es_password | to_json }}
+  metrics.period: 5s

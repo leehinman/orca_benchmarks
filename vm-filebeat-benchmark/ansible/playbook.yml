@@ -1,0 +1,162 @@
+---
+- name: Check the remote Elasticsearch accepts monitoring data
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  any_errors_fatal: true
+
+  tasks:
+    - name: Read cluster settings
+      ansible.builtin.uri:
+        url: "{{ es_url }}/_cluster/settings?flat_settings=true"
+        url_username: "{{ es_user }}"
+        url_password: "{{ es_password }}"
+        force_basic_auth: true
+        status_code: [200, 403]
+        return_content: true
+      register: es_cluster_settings
+
+    - name: Require xpack.monitoring.collection.enabled
+      ansible.builtin.assert:
+        that: >-
+          (es_cluster_settings.json.transient['xpack.monitoring.collection.enabled']
+          | default(es_cluster_settings.json.persistent['xpack.monitoring.collection.enabled']
+          | default('false'))) | string | lower == 'true'
+        fail_msg: >-
+          Elasticsearch drops legacy monitoring data unless
+          xpack.monitoring.collection.enabled is true; set it with
+          PUT _cluster/settings {"persistent":{"xpack.monitoring.collection.enabled":true}}
+      when: es_cluster_settings.status == 200
+
+- name: Prepare the agent VM
+  hosts: all
+  become: true
+  gather_facts: false
+  any_errors_fatal: true
+
+  tasks:
+    - name: Wait for SSH to come up
+      ansible.builtin.wait_for_connection:
+        delay: 5
+        sleep: 5
+        timeout: 600
+
+    - name: Wait for cloud-init to finish
+      ansible.builtin.command: cloud-init status --wait
+      changed_when: false
+      failed_when: false
+
+    - name: Gather facts
+      ansible.builtin.setup:
+
+- name: Install flog
+  hosts: all
+  become: true
+  any_errors_fatal: true
+
+  tasks:
+    - name: Create flog log directory
+      ansible.builtin.file:
+        path: "{{ flog_dir }}"
+        state: directory
+        owner: root
+        group: root
+        mode: '0755'
+
+    - name: Copy flog binary
+      ansible.builtin.copy:
+        src: "{{ flog_binary_path }}"
+        dest: /usr/local/bin/flog
+        owner: root
+        group: root
+        mode: '0755'
+
+- name: Install filebeat
+  hosts: all
+  become: true
+  any_errors_fatal: true
+
+  tasks:
+    - name: Copy the supplied filebeat tar.gz
+      ansible.builtin.copy:
+        src: "{{ filebeat_tarball_path }}"
+        dest: /var/tmp/filebeat.tar.gz
+        mode: '0644'
+      when: filebeat_tarball_path | length > 0
+
+    - name: Download filebeat tar.gz
+      ansible.builtin.get_url:
+        url: "https://artifacts.elastic.co/downloads/beats/filebeat/{{ filebeat_tgz_name }}"
+        dest: /var/tmp/filebeat.tar.gz
+        mode: '0644'
+        timeout: 300
+      when: filebeat_tarball_path | length == 0 and not (filebeat_is_snapshot | bool)
+
+    - name: Look up filebeat snapshot tar.gz URL
+      ansible.builtin.uri:
+        url: "{{ filebeat_artifacts_api }}/{{ filebeat_tgz_name }}"
+        timeout: 300
+        return_content: true
+      register: filebeat_artifact
+      delegate_to: localhost
+      become: false
+      when: filebeat_tarball_path | length == 0 and (filebeat_is_snapshot | bool)
+
+    - name: Download filebeat snapshot tar.gz
+      ansible.builtin.get_url:
+        url: "{{ filebeat_artifact.json.packages[filebeat_tgz_name].url }}"
+        dest: /var/tmp/filebeat.tar.gz
+        timeout: 300
+      register: filebeat_snapshot_dl
+      until: filebeat_snapshot_dl is succeeded
+      retries: 3
+      delay: 15
+      when: filebeat_tarball_path | length == 0 and (filebeat_is_snapshot | bool)
+
+    - name: Remove any previous filebeat install
+      ansible.builtin.file:
+        path: "{{ filebeat_home }}"
+        state: absent
+
+    - name: Create filebeat directories
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: directory
+        mode: '0755'
+      loop:
+        - "{{ filebeat_home }}"
+        - "{{ filebeat_data }}"
+
+    - name: Extract filebeat
+      ansible.builtin.unarchive:
+        src: /var/tmp/filebeat.tar.gz
+        dest: "{{ filebeat_home }}"
+        remote_src: true
+        extra_opts: [--strip-components=1]
+
+    - name: Remove filebeat tar.gz
+      ansible.builtin.file:
+        path: /var/tmp/filebeat.tar.gz
+        state: absent
+
+    - name: Write filebeat.yml
+      ansible.builtin.template:
+        src: filebeat.yml.j2
+        dest: "{{ filebeat_home }}/filebeat.yml"
+        owner: root
+        group: root
+        mode: '0600'
+
+    - name: Validate filebeat config
+      ansible.builtin.command: "{{ filebeat_home }}/filebeat test config --path.home {{ filebeat_home }} --path.data {{ filebeat_data }} -c {{ filebeat_home }}/filebeat.yml"
+      changed_when: false
+
+    - name: Install filebeat systemd unit
+      ansible.builtin.template:
+        src: filebeat.service.j2
+        dest: /etc/systemd/system/filebeat.service
+        mode: '0644'
+
+    - name: Reload systemd
+      ansible.builtin.systemd:
+        daemon_reload: true

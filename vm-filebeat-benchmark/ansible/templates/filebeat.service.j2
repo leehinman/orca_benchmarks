@@ -1,0 +1,12 @@
+[Unit]
+Description=Filebeat under test
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+ExecStart={{ filebeat_home }}/filebeat -e --path.home {{ filebeat_home }} --path.data {{ filebeat_data }} -c {{ filebeat_home }}/filebeat.yml
+Restart=no
+LimitNOFILE=65535
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,15 @@
+ansible_user: ubuntu
+ansible_ssh_common_args: '-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR'
+
+es_url: "{{ lookup('env', 'ES_URL') }}"
+es_user: "{{ lookup('env', 'ES_USER') }}"
+es_password: "{{ lookup('env', 'ES_PASSWORD') }}"
+
+flog_dir: /var/log/flog
+filebeat_home: /opt/filebeat
+filebeat_data: /var/lib/filebeat
+
+filebeat_is_snapshot: "{{ '-SNAPSHOT' in filebeat_version }}"
+filebeat_artifacts_api: "https://artifacts-api.elastic.co/v1/search/{{ filebeat_version }}"
+tgz_arch: "{{ 'arm64' if ansible_architecture == 'aarch64' else 'x86_64' }}"
+filebeat_tgz_name: "filebeat-{{ filebeat_version }}-linux-{{ tgz_arch }}.tar.gz"
